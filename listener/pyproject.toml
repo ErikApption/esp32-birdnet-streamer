@@ -12,6 +12,9 @@ fastapi = "^0.115.0"
 uvicorn = {version = "^0.30.0", extras = ["standard"]}
 zeroconf = "^0.135.0"
 httpx = "^0.28.0"
+numpy = "^2.0.0"
+scipy = "^1.14.0"
+opuslib-next = ">=1.0"
 
 [tool.poetry.scripts]
 birdnet-listener = "birdnet_listener.main:main"

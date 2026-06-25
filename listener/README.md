@@ -7,6 +7,10 @@ A Python service that receives the raw PCM audio stream from the ESP32 BirdNet S
 - Python 3.10+
 - Poetry
 
+## Power Consumption
+
+0.115 A 5V
+
 ## Installation
 
 ```bash
