@@ -250,9 +250,16 @@ void httpInit() {
 
 // ─── mDNS Setup ──────────────────────────────────────────────────────────────
 void mdnsInit() {
+    // Give the WiFi stack time to fully stabilize before starting mDNS
+    delay(200);
+
     if (!MDNS.begin(MDNS_HOSTNAME)) {
-        Serial.println("[mDNS] Failed to start");
-        return;
+        Serial.println("[mDNS] Failed to start — retrying once...");
+        delay(1000);
+        if (!MDNS.begin(MDNS_HOSTNAME)) {
+            Serial.println("[mDNS] Failed to start on retry");
+            return;
+        }
     }
 
     // Advertise HTTP config server
@@ -363,6 +370,9 @@ void otaInit() {
 
 // ─── WiFi Setup via WiFiManager ──────────────────────────────────────────────
 void wifiInit() {
+    // Set hostname before connecting — required for mDNS to work reliably
+    WiFi.setHostname(MDNS_HOSTNAME);
+
 #if defined(WIFI_SSID) && defined(WIFI_PASSWORD)
     // Compile-time credentials provided — try connecting directly first
     Serial.printf("[WiFi] Connecting to %s (build-time credentials)...\n", WIFI_SSID);
