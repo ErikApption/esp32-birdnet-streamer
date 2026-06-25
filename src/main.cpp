@@ -51,6 +51,7 @@ char utcOffset[4]   = DEFAULT_UTC_OFFSET;
 bool sleepEnabled   = false;
 uint32_t sampleRate = DEFAULT_SAMPLE_RATE;
 char sampleRateStr[8] = "48000";
+bool configured     = false;  // true once a config has been received (persisted in NVS)
 
 static int16_t i2sBuffer[DMA_BUF_LEN];
 
@@ -65,6 +66,7 @@ void i2sInit();
 void udpInit();
 void httpInit();
 void mdnsInit();
+void startStreaming();
 IPAddress resolveHost(const char* hostname);
 void streamAudio();
 void enterDeepSleep(uint64_t sleepSeconds);
@@ -101,6 +103,7 @@ void loadSettings() {
     String uo = prefs.getString("utcOffset", DEFAULT_UTC_OFFSET);
     sleepEnabled = prefs.getBool("sleepOn", true);
     sampleRate = prefs.getUInt("sampleRate", DEFAULT_SAMPLE_RATE);
+    configured = prefs.getBool("configured", false);
     prefs.end();
 
     strncpy(udpHost, h.c_str(), sizeof(udpHost) - 1);
@@ -109,6 +112,8 @@ void loadSettings() {
     strncpy(longitude, lo.c_str(), sizeof(longitude) - 1);
     strncpy(utcOffset, uo.c_str(), sizeof(utcOffset) - 1);
     snprintf(sampleRateStr, sizeof(sampleRateStr), "%lu", (unsigned long)sampleRate);
+
+    Serial.printf("[NVS] Configured: %s\n", configured ? "yes" : "no");
 }
 
 void saveSettings() {
@@ -120,12 +125,14 @@ void saveSettings() {
     prefs.putString("utcOffset", utcOffset);
     prefs.putBool("sleepOn", sleepEnabled);
     prefs.putUInt("sampleRate", sampleRate);
+    prefs.putBool("configured", configured);
     prefs.end();
 }
 
 // ─── WiFiManager save callback ───────────────────────────────────────────────
 void saveParamsCallback() {
-    Serial.println("[WiFiManager] Parameters saved");
+    configured = true;
+    Serial.println("[WiFiManager] Parameters saved — device configured");
 }
 
 // ─── HTTP Configuration Server ───────────────────────────────────────────────
@@ -137,7 +144,8 @@ void handleGetConfig() {
     json += "\"latitude\":\"" + String(latitude) + "\",";
     json += "\"longitude\":\"" + String(longitude) + "\",";
     json += "\"utc_offset\":\"" + String(utcOffset) + "\",";
-    json += "\"sleep_enabled\":" + String(sleepEnabled ? "true" : "false");
+    json += "\"sleep_enabled\":" + String(sleepEnabled ? "true" : "false") + ",";
+    json += "\"configured\":" + String(configured ? "true" : "false");
     json += "}";
     server.send(200, "application/json", json);
 }
@@ -186,6 +194,7 @@ void handlePostConfig() {
     }
 
     if (changed) {
+        configured = true;
         saveSettings();
         Serial.printf("[HTTP] Config updated — UDP: %s:%s, rate: %lu, sleep: %s\n",
             udpHost, udpPort, (unsigned long)sampleRate, sleepEnabled ? "on" : "off");
@@ -695,6 +704,33 @@ void streamAudio() {
 // ─── Main ────────────────────────────────────────────────────────────────────
 #define SCHEDULE_CHECK_INTERVAL_MS  (5 * 60 * 1000)
 unsigned long lastScheduleCheck = 0;
+bool streamingStarted = false;
+
+void startStreaming() {
+    if (streamingStarted) return;
+
+    Serial.println("[Boot] Configuration received — starting audio streaming");
+    syncTime();
+
+    // Check schedule — go to sleep if outside window and sleep is enabled
+    if (sleepEnabled && !isWithinActiveWindow()) {
+        Serial.println("[Schedule] Outside active window — going to sleep");
+        uint64_t sleepSec = secondsUntilNextActiveWindow();
+        enterDeepSleep(sleepSec);
+        // Never reaches here
+    }
+
+    Serial.println("[Schedule] Within active window — starting audio services");
+    i2sInit();
+    udpInit();
+
+    streamingStarted = true;
+    lastScheduleCheck = millis();
+    Serial.println("──────────────────────────────────────────────────");
+    Serial.println("[Boot] Streaming audio");
+    Serial.printf("[Boot] Free Heap: %lu bytes\n", (unsigned long)ESP.getFreeHeap());
+    Serial.println("══════════════════════════════════════════════════\n");
+}
 
 void setup() {
     Serial.begin(115200);
@@ -714,43 +750,47 @@ void setup() {
     loadSettings();
 
     wifiInit();
-    syncTime();
 
-    // Check schedule — go to sleep if outside window and sleep is enabled
-    if (sleepEnabled && !isWithinActiveWindow()) {
-        Serial.println("[Schedule] Outside active window — going to sleep");
-        uint64_t sleepSec = secondsUntilNextActiveWindow();
-        enterDeepSleep(sleepSec);
-        // Never reaches here
-    }
-
-    Serial.println("[Schedule] Within active window — starting services");
+    // Always start OTA, mDNS, and HTTP so the device is discoverable
     otaInit();
     mdnsInit();
-    i2sInit();
-    udpInit();
     httpInit();
 
-    lastScheduleCheck = millis();
-    Serial.println("──────────────────────────────────────────────────");
-    Serial.println("[Boot] Setup complete — streaming audio");
-    Serial.printf("[Boot] Free Heap after init: %lu bytes\n", (unsigned long)ESP.getFreeHeap());
-    Serial.println("══════════════════════════════════════════════════\n");
+    if (configured) {
+        // Device was previously configured — go straight to streaming
+        startStreaming();
+    } else {
+        // Not yet configured — wait in discovery mode
+        Serial.println("══════════════════════════════════════════════════");
+        Serial.println("[Boot] WAITING FOR CONFIGURATION");
+        Serial.printf("[Boot] Connect to http://%s.local/config to configure\n", MDNS_HOSTNAME);
+        Serial.printf("[Boot] Or POST to http://%s/config\n", WiFi.localIP().toString().c_str());
+        Serial.println("══════════════════════════════════════════════════");
+    }
 }
 
 void loop() {
     ArduinoOTA.handle();
     server.handleClient();
-    streamAudio();
 
-    // Periodically check if we've passed sunset
-    if (millis() - lastScheduleCheck >= SCHEDULE_CHECK_INTERVAL_MS) {
-        lastScheduleCheck = millis();
+    // If we just got configured, transition to streaming
+    if (configured && !streamingStarted) {
+        startStreaming();
+    }
 
-        if (sleepEnabled && !isWithinActiveWindow()) {
-            Serial.println("[Schedule] Active window ended — going to sleep");
-            uint64_t sleepSec = secondsUntilNextActiveWindow();
-            enterDeepSleep(sleepSec);
+    // Only stream audio if fully configured and started
+    if (streamingStarted) {
+        streamAudio();
+
+        // Periodically check if we've passed sunset
+        if (millis() - lastScheduleCheck >= SCHEDULE_CHECK_INTERVAL_MS) {
+            lastScheduleCheck = millis();
+
+            if (sleepEnabled && !isWithinActiveWindow()) {
+                Serial.println("[Schedule] Active window ended — going to sleep");
+                uint64_t sleepSec = secondsUntilNextActiveWindow();
+                enterDeepSleep(sleepSec);
+            }
         }
     }
 }
