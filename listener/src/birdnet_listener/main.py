@@ -18,11 +18,16 @@ from collections import deque
 from typing import AsyncGenerator
 
 import httpx
+import numpy as np
 import uvicorn
 from fastapi import FastAPI, Request
 from fastapi.responses import PlainTextResponse, StreamingResponse
 from zeroconf import Zeroconf, ServiceBrowser, ServiceStateChange
 from zeroconf.asyncio import AsyncZeroconf, AsyncServiceBrowser
+
+import opuslib_next as opuslib
+
+from birdnet_listener.noise_reducer import NoiseReducer
 
 logger = logging.getLogger("birdnet-listener")
 
@@ -99,10 +104,10 @@ def get_local_ip() -> str:
         s.close()
 
 
-def push_config_to_esp32(esp32_ip: str, listener_ip: str, udp_port: int) -> bool:
+def push_config_to_esp32(esp32_ip: str, listener_ip: str, udp_port: int, timeout: float = 5.0) -> bool:
     """
     POST to the ESP32's /config endpoint to set udp_host to our IP.
-    Returns True on success.
+    Returns True on success, False on failure.
     """
     url = f"http://{esp32_ip}/config"
     data = {
@@ -113,7 +118,7 @@ def push_config_to_esp32(esp32_ip: str, listener_ip: str, udp_port: int) -> bool
     logger.info(f"[Config] Pushing config to ESP32 at {url}: udp_host={listener_ip}, udp_port={udp_port}")
 
     try:
-        resp = httpx.post(url, data=data, timeout=5.0)
+        resp = httpx.post(url, data=data, timeout=timeout)
         if resp.status_code == 200:
             logger.info(f"[Config] ESP32 config updated successfully: {resp.json()}")
             return True
@@ -128,45 +133,158 @@ def push_config_to_esp32(esp32_ip: str, listener_ip: str, udp_port: int) -> bool
 # ─── Audio ring buffer shared between UDP receiver and HTTP clients ───────────
 
 class AudioBuffer:
-    """Thread-safe ring buffer that holds recent audio chunks for streaming."""
+    """Ring buffer that holds recent audio chunks for streaming to HTTP clients."""
 
     def __init__(self, max_chunks: int = 200):
         self._buffer: deque[bytes] = deque(maxlen=max_chunks)
-        self._event = asyncio.Event()
         self._seq = 0
+        self._subscribers: list[asyncio.Event] = []
 
     def push(self, data: bytes) -> None:
         self._buffer.append(data)
         self._seq += 1
-        self._event.set()
-        self._event.clear()
+        # Wake all waiting subscribers
+        for event in self._subscribers:
+            event.set()
 
     async def stream_from(self) -> AsyncGenerator[bytes, None]:
-        """Yield audio chunks as they arrive."""
+        """Yield audio chunks as they arrive. Each caller gets its own wakeup event."""
+        event = asyncio.Event()
+        self._subscribers.append(event)
         last_seq = self._seq
-        while True:
-            await self._event.wait()
-            new_chunks = self._seq - last_seq
-            if new_chunks > 0:
-                available = list(self._buffer)
-                start = max(0, len(available) - new_chunks)
-                for chunk in available[start:]:
-                    yield chunk
-                last_seq = self._seq
+        try:
+            while True:
+                await event.wait()
+                event.clear()
+
+                new_chunks = self._seq - last_seq
+                if new_chunks > 0:
+                    available = list(self._buffer)
+                    start = max(0, len(available) - new_chunks)
+                    for chunk in available[start:]:
+                        yield chunk
+                    last_seq = self._seq
+        finally:
+            self._subscribers.remove(event)
 
 
 # ─── UDP Receiver Protocol ────────────────────────────────────────────────────
 
 class UDPReceiverProtocol(asyncio.DatagramProtocol):
-    """Asyncio UDP protocol that pushes received audio into the buffer."""
+    """Asyncio UDP protocol that decodes Opus and pushes PCM audio into the buffer."""
 
-    def __init__(self, audio_buffer: AudioBuffer):
+    LOG_INTERVAL = 5.0  # seconds between status logs
+    PACKET_MAGIC = b"OP"
+    HEADER_SIZE = 4  # 2 bytes magic + 1 byte frame_count + 1 byte sequence_number
+
+    def __init__(self, audio_buffer: AudioBuffer, opus_decoder: opuslib.Decoder):
         self.audio_buffer = audio_buffer
+        self.opus_decoder = opus_decoder
         self.packets_received = 0
+        self._receiving = False
+        self._packets_since_last_log = 0
+        self._bytes_since_last_log = 0
+        self._decode_errors = 0
+        self._dropped_packets = 0
+        self._invalid_packets = 0
+        self._expected_seq: int | None = None
+        self._log_task: asyncio.TimerHandle | None = None
+
+    def connection_made(self, transport) -> None:
+        self.transport = transport
+        self._schedule_log()
+
+    def _schedule_log(self) -> None:
+        loop = asyncio.get_event_loop()
+        self._log_task = loop.call_later(self.LOG_INTERVAL, self._log_status)
+
+    def _log_status(self) -> None:
+        if self._packets_since_last_log > 0:
+            if not self._receiving:
+                logger.info("[UDP] Receiving audio stream")
+                self._receiving = True
+            msg = (
+                f"[UDP] {self._packets_since_last_log} packets received "
+                f"({self._bytes_since_last_log / 1024:.1f} KB) in the last "
+                f"{self.LOG_INTERVAL:.0f}s — total: {self.packets_received}"
+            )
+            if self._dropped_packets > 0:
+                msg += f" — dropped: {self._dropped_packets}"
+            logger.info(msg)
+        else:
+            if self._receiving:
+                logger.info("[UDP] Stream stopped — no packets received")
+                self._receiving = False
+        self._packets_since_last_log = 0
+        self._bytes_since_last_log = 0
+        self._schedule_log()
 
     def datagram_received(self, data: bytes, addr: tuple) -> None:
         self.packets_received += 1
-        self.audio_buffer.push(data)
+        self._packets_since_last_log += 1
+        self._bytes_since_last_log += len(data)
+
+        # ─── Validate header ─────────────────────────────────────────────
+        if len(data) < self.HEADER_SIZE:
+            self._invalid_packets += 1
+            if self._invalid_packets <= 3:
+                logger.warning(f"[UDP] Packet too short ({len(data)} bytes), need at least {self.HEADER_SIZE}")
+            return
+
+        if data[0:2] != self.PACKET_MAGIC:
+            self._invalid_packets += 1
+            if self._invalid_packets <= 3:
+                logger.warning(f"[UDP] Invalid magic: {data[0:2].hex()} (expected 4f50), first 16 bytes: {data[:16].hex()}")
+            return
+
+        frame_count = data[2]
+        seq = data[3]
+
+        # ─── Detect dropped packets ──────────────────────────────────────
+        if self._expected_seq is not None:
+            if seq != self._expected_seq:
+                # Calculate how many packets were missed (handles wrap-around)
+                gap = (seq - self._expected_seq) & 0xFF
+                self._dropped_packets += gap
+                logger.debug(f"[UDP] Packet drop detected: expected seq {self._expected_seq}, got {seq} (gap={gap})")
+        self._expected_seq = (seq + 1) & 0xFF
+
+        # ─── Decode Opus frames ──────────────────────────────────────────
+        payload = data[self.HEADER_SIZE:]
+        offset = 0
+
+        for i in range(frame_count):
+            # Each frame is preceded by a 2-byte little-endian length
+            if offset + 2 > len(payload):
+                self._decode_errors += 1
+                if self._decode_errors <= 5:
+                    logger.warning(f"[UDP] Truncated packet: missing frame length at frame {i+1}/{frame_count}")
+                break
+
+            frame_len = int.from_bytes(payload[offset:offset + 2], "big")
+            offset += 2
+
+            if offset + frame_len > len(payload):
+                self._decode_errors += 1
+                if self._decode_errors <= 5:
+                    logger.warning(f"[UDP] Truncated packet: frame {i+1}/{frame_count} needs {frame_len} bytes, only {len(payload) - offset} available")
+                break
+
+            opus_frame = payload[offset:offset + frame_len]
+            offset += frame_len
+
+            try:
+                # frame_size=5760 supports up to 120ms at 48kHz (max Opus frame)
+                pcm = self.opus_decoder.decode(opus_frame, frame_size=5760)
+                self.audio_buffer.push(pcm)
+                if self.packets_received <= 3:
+                    logger.info(f"[UDP] Decoded frame: {len(opus_frame)} bytes Opus -> {len(pcm)} bytes PCM")
+            except opuslib.OpusError as e:
+                self._decode_errors += 1
+                if self._decode_errors <= 5:
+                    logger.warning(f"[UDP] Opus decode error (frame {i+1}/{frame_count}): {e}")
+                elif self._decode_errors == 6:
+                    logger.warning("[UDP] Suppressing further Opus decode errors")
 
     def error_received(self, exc: Exception) -> None:
         logger.error(f"UDP error: {exc}")
@@ -203,9 +321,66 @@ def make_wav_header(sample_rate: int, bits_per_sample: int = 16, channels: int =
     return header
 
 
+# ─── Audio Normalizer ─────────────────────────────────────────────────────────
+
+class AudioNormalizer:
+    """
+    Peak-normalizes PCM 16-bit audio chunks to a target dBFS level.
+
+    Uses a smoothed gain factor to avoid abrupt volume changes between chunks.
+    """
+
+    def __init__(self, target_db: float = -3.0, attack: float = 0.1, release: float = 0.5):
+        """
+        Args:
+            target_db: Target peak level in dBFS (e.g., -3.0 means normalize peaks to -3 dB).
+            attack: How quickly gain increases when signal gets louder (0-1, lower = smoother).
+            release: How quickly gain decreases when signal gets quieter (0-1, lower = smoother).
+        """
+        self.target_linear = 10 ** (target_db / 20.0) * 32767
+        self.attack = attack
+        self.release = release
+        self.current_gain = 1.0
+
+    def normalize(self, data: bytes) -> bytes:
+        """Normalize a PCM 16-bit mono audio chunk, returning the normalized bytes."""
+        samples = np.frombuffer(data, dtype=np.int16).astype(np.float32)
+
+        if len(samples) == 0:
+            return data
+
+        peak = np.max(np.abs(samples))
+        if peak < 1.0:
+            # Silence or near-silence — don't amplify noise
+            return data
+
+        desired_gain = self.target_linear / peak
+
+        # Smooth the gain change to avoid clicking/pumping
+        if desired_gain < self.current_gain:
+            # Signal got louder — respond quickly (attack)
+            self.current_gain += self.attack * (desired_gain - self.current_gain)
+        else:
+            # Signal got quieter — respond slowly (release)
+            self.current_gain += self.release * (desired_gain - self.current_gain)
+
+        # Apply gain and clip to int16 range
+        normalized = samples * self.current_gain
+        normalized = np.clip(normalized, -32768, 32767)
+
+        return normalized.astype(np.int16).tobytes()
+
+
 # ─── Application Factory ─────────────────────────────────────────────────────
 
-def create_app(udp_port: int, sample_rate: int, http_port: int) -> FastAPI:
+def create_app(
+    udp_port: int,
+    sample_rate: int,
+    http_port: int,
+    channels: int = 1,
+    normalizer: AudioNormalizer | None = None,
+    noise_reducer: NoiseReducer | None = None,
+) -> FastAPI:
     app = FastAPI(title="BirdNet Listener")
     audio_buffer = AudioBuffer()
     udp_protocol: UDPReceiverProtocol | None = None
@@ -215,8 +390,12 @@ def create_app(udp_port: int, sample_rate: int, http_port: int) -> FastAPI:
         nonlocal udp_protocol
         loop = asyncio.get_running_loop()
 
+        # Set up Opus decoder
+        opus_decoder = opuslib.Decoder(sample_rate, channels)
+        logger.info(f"Opus decoder initialized ({sample_rate} Hz, {channels}ch)")
+
         transport, udp_protocol = await loop.create_datagram_endpoint(
-            lambda: UDPReceiverProtocol(audio_buffer),
+            lambda: UDPReceiverProtocol(audio_buffer, opus_decoder),
             local_addr=("0.0.0.0", udp_port),
             family=socket.AF_INET,
         )
@@ -229,7 +408,15 @@ def create_app(udp_port: int, sample_rate: int, http_port: int) -> FastAPI:
             "udp_port": udp_port,
             "http_port": http_port,
             "sample_rate": sample_rate,
+            "normalize": normalizer is not None,
+            "noise_reduce": noise_reducer is not None,
             "packets_received": udp_protocol.packets_received if udp_protocol else 0,
+            "invalid_packets": udp_protocol._invalid_packets if udp_protocol else 0,
+            "decode_errors": udp_protocol._decode_errors if udp_protocol else 0,
+            "dropped_packets": udp_protocol._dropped_packets if udp_protocol else 0,
+            "buffer_chunks": len(audio_buffer._buffer),
+            "buffer_seq": audio_buffer._seq,
+            "active_subscribers": len(audio_buffer._subscribers),
             "endpoints": {
                 "playlist": "/stream.m3u",
                 "stream": "/stream",
@@ -258,7 +445,16 @@ def create_app(udp_port: int, sample_rate: int, http_port: int) -> FastAPI:
         async def audio_generator() -> AsyncGenerator[bytes, None]:
             yield wav_header
             async for chunk in audio_buffer.stream_from():
-                yield chunk
+                processed = chunk
+                # Apply noise reduction first (operates on raw signal)
+                if noise_reducer is not None:
+                    processed = noise_reducer.reduce(processed)
+                    if not processed:
+                        continue
+                # Then normalize the cleaned signal
+                if normalizer is not None:
+                    processed = normalizer.normalize(processed)
+                yield processed
 
         return StreamingResponse(
             audio_generator(),
@@ -283,6 +479,16 @@ def main():
     parser.add_argument("--esp32-ip", type=str, default=None, help="ESP32 IP (skips mDNS discovery)")
     parser.add_argument("--listener-ip", type=str, default=None, help="Override local IP sent to ESP32")
     parser.add_argument("--skip-discovery", action="store_true", help="Skip mDNS discovery and config push")
+    parser.add_argument("--normalize", action="store_true", help="Enable audio normalization (boosts quiet audio)")
+    parser.add_argument(
+        "--normalize-target-db", type=float, default=-3.0,
+        help="Target peak level in dBFS when normalizing (default: -3.0)",
+    )
+    parser.add_argument("--noise-reduce", action="store_true", help="Enable spectral gating noise reduction")
+    parser.add_argument(
+        "--noise-reduce-threshold-db", type=float, default=-12.0,
+        help="Gate threshold in dB above noise floor (default: -12.0, lower = more aggressive)",
+    )
     parser.add_argument("--log-level", default="info", choices=["debug", "info", "warning", "error"])
     args = parser.parse_args()
 
@@ -291,34 +497,60 @@ def main():
         format="%(asctime)s [%(name)s] %(levelname)s: %(message)s",
     )
 
-    # ─── Resolve ESP32 IP ─────────────────────────────────────────────────
+    # ─── Discover ESP32 and push config (retries until successful) ───────
     # Priority: env var > CLI arg > mDNS discovery
     esp32_ip = os.environ.get("BIRDNET_ESP32_IP") or args.esp32_ip
 
     if not args.skip_discovery:
-        if not esp32_ip:
-            logger.info("No ESP32 IP provided, attempting mDNS discovery...")
-            esp32_ip = discover_esp32(timeout=10.0)
+        import time
 
-        if esp32_ip:
-            # Determine our local IP to push to the ESP32
-            listener_ip = os.environ.get("BIRDNET_LISTENER_IP") or args.listener_ip or get_local_ip()
-            push_config_to_esp32(esp32_ip, listener_ip, args.udp_port)
-        else:
-            logger.warning(
-                "Could not find ESP32 on the network. "
-                "Set BIRDNET_ESP32_IP env var or use --esp32-ip to provide it manually. "
-                "Continuing anyway — will listen for UDP packets on port %d.",
-                args.udp_port,
-            )
+        listener_ip = os.environ.get("BIRDNET_LISTENER_IP") or args.listener_ip or get_local_ip()
+
+        while True:
+            # Discover ESP32 if we don't have an IP yet
+            if not esp32_ip:
+                logger.info("No ESP32 IP provided, attempting mDNS discovery...")
+                esp32_ip = discover_esp32(timeout=10.0)
+
+            if not esp32_ip:
+                logger.warning("[Discovery] ESP32 not found, retrying in 5s...")
+                time.sleep(5)
+                continue
+
+            # Try to push config
+            if push_config_to_esp32(esp32_ip, listener_ip, args.udp_port):
+                break
+
+            # Config push failed — ESP32 might have moved or rebooted
+            logger.warning("[Discovery] Config push failed, re-discovering in 5s...")
+            esp32_ip = None
+            time.sleep(5)
     else:
         logger.info("Skipping mDNS discovery (--skip-discovery)")
 
     # ─── Start the HTTP + UDP server ──────────────────────────────────────
+    normalizer = None
+    if args.normalize:
+        normalizer = AudioNormalizer(target_db=args.normalize_target_db)
+        logger.info(f"Audio normalization enabled (target: {args.normalize_target_db} dBFS)")
+
+    noise_reducer = None
+    if args.noise_reduce:
+        noise_reducer = NoiseReducer(
+            sample_rate=args.sample_rate,
+            gate_threshold_db=args.noise_reduce_threshold_db,
+        )
+        logger.info(
+            f"Noise reduction enabled (threshold: {args.noise_reduce_threshold_db} dB, "
+            f"estimating noise profile from first ~2s of audio)"
+        )
+
     app = create_app(
         udp_port=args.udp_port,
         sample_rate=args.sample_rate,
         http_port=args.http_port,
+        normalizer=normalizer,
+        noise_reducer=noise_reducer,
     )
 
     logger.info(f"Starting BirdNet Listener — UDP:{args.udp_port} → HTTP:{args.http_port}")
