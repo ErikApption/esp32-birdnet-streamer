@@ -1,0 +1,21 @@
+[tool.poetry]
+name = "birdnet-listener"
+version = "0.1.0"
+description = "Receives UDP audio from ESP32 BirdNet streamer and serves it as an HTTP audio stream with M3U playlist"
+authors = []
+readme = "README.md"
+packages = [{include = "birdnet_listener", from = "src"}]
+
+[tool.poetry.dependencies]
+python = "^3.10"
+fastapi = "^0.115.0"
+uvicorn = {version = "^0.30.0", extras = ["standard"]}
+zeroconf = "^0.135.0"
+httpx = "^0.28.0"
+
+[tool.poetry.scripts]
+birdnet-listener = "birdnet_listener.main:main"
+
+[build-system]
+requires = ["poetry-core"]
+build-backend = "poetry.core.masonry.api"

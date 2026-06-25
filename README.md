@@ -1,2 +1,311 @@
-# esp32-birdnet-streamer
-ESP32 project to stream audio from i2s mic for birdnet processing
+# ESP32 BirdNet Streamer
+
+ESP32-S3 project that captures audio from an I2S MEMS microphone and streams raw PCM data over UDP for BirdNET processing. Includes WiFi captive-portal configuration, sunrise/sunset scheduling with deep sleep, and OTA firmware updates.
+
+## Features
+
+- **I2S microphone input** — 16-bit mono at 16 kHz, streamed as raw PCM over UDP
+- **WiFi configuration** — captive portal (WiFiManager) for zero-code network setup
+- **OTA updates** — push new firmware over the network without a USB cable
+- **Sleep schedule** — active from 1 hour before sunrise until sunset, deep sleep overnight
+- **Configurable location** — latitude, longitude, and UTC offset set via the portal
+
+## Hardware
+
+- ESP32-S3-DevKitC1 (N16R8)
+- I2S MEMS microphone (e.g. INMP441, SPH0645, ICS-43434)
+
+### Wiring the I2S Microphone
+
+Most I2S MEMS microphones (INMP441, SPH0645, ICS-43434) have 6 pins. Connect them to the ESP32-S3 DevKitC as follows:
+
+| Mic Pin | Function       | Wire   | ESP32-S3 GPIO | Notes                                                                       |
+| ------- | -------------- | ------ | ------------- | --------------------------------------------------------------------------- |
+| VDD     | Power          | Brown  | 3.3V          | Do NOT use 5V — MEMS mics are 3.3V devices                                  |
+| GND     | Ground         | Black  | GND           |                                                                             |
+| SCK     | Bit Clock      | Orange | GPIO 4        | Serial clock driven by ESP32                                                |
+| WS      | Word Select    | Yellow | GPIO 5        | Frame/channel sync signal                                                   |
+| SD      | Serial Data    | Red    | GPIO 6        | Audio data output from mic                                                  |
+| L/R     | Channel select | Green  | GND           | Tie to GND for left channel, 3.3V for right channel. Code defaults to left. |
+
+#### Wiring diagram (text)
+
+```
+ESP32-S3 DevKitC              I2S MEMS Mic
+─────────────────             ────────────
+3.3V  ────────────────────────  VDD
+GND   ────────────────────────  GND
+GPIO 4 ───────────────────────  SCK
+GPIO 5 ───────────────────────  WS
+GPIO 6 ───────────────────────  SD
+GND   ────────────────────────  L/R  ← left channel
+```
+
+#### Tips
+
+- Keep wires short (< 10 cm) to avoid noise on the clock lines.
+- Add a 100 nF decoupling capacitor between VDD and GND as close to the mic as possible.
+- If you hear silence, double-check that L/R (SEL) is tied to GND (left) — the firmware reads the left channel only.
+- To use the right channel instead, change `I2S_CHANNEL_FMT_ONLY_LEFT` to `I2S_CHANNEL_FMT_ONLY_RIGHT` in `main.cpp` and tie L/R to 3.3V.
+- The pin assignments can be changed by editing the `I2S_WS_PIN`, `I2S_SD_PIN`, and `I2S_SCK_PIN` defines at the top of `main.cpp`.
+
+## Build Instructions
+
+### Prerequisites
+
+- [PlatformIO](https://platformio.org/) (CLI or VS Code extension)
+- USB-C cable for initial flash
+
+### Build and Flash (USB)
+
+```bash
+# Clone the repository
+git clone https://github.com/your-user/esp32-birdnet-streamer.git
+cd esp32-birdnet-streamer
+
+# Build the firmware
+pio run
+
+# Upload via USB (board must be connected)
+pio run --target upload
+
+# Open serial monitor
+pio device monitor -b 115200
+```
+
+### First Boot — WiFi Setup
+
+1. Power on the board. It will create a WiFi access point named **BirdNet-Setup**.
+2. Connect to that AP from your phone or laptop.
+3. A captive portal opens automatically. Fill in:
+   - Your WiFi SSID and password
+   - **UDP Host** — IP address or `.local` hostname of the machine running BirdNET
+   - **UDP Port** — port BirdNET is listening on (default `4000`)
+   - **Sample Rate** — audio sample rate in Hz (default `48000`, see allowed values below)
+   - **Latitude** / **Longitude** — your location for sunrise/sunset (default: Ottawa, 45.4215 / -75.6972)
+   - **UTC Offset** — timezone offset in hours (default: `-5` for EST)
+4. Click Save. The board connects to your WiFi and begins streaming.
+
+Credentials and parameters are stored in flash — subsequent boots connect automatically.
+
+### Changing WiFi Network
+
+If you need to connect the board to a different WiFi network:
+
+1. **Automatic fallback** — If the saved network is unavailable (moved location, changed router, etc.), the board will fail to connect after a few seconds and automatically relaunch the **BirdNet-Setup** captive portal. Connect to that AP and enter the new credentials.
+
+2. **Manual reset** — To force the portal even while the saved network is available:
+   - **Option A (serial):** Open a serial terminal, trigger a WiFi reset by adding a call to `wm.resetSettings()` before `wm.autoConnect(...)` in the source, flash once, then remove it.
+   - **Option B (erase flash):** Run the following PlatformIO command to wipe all saved settings (WiFi credentials + parameters):
+     ```bash
+     pio run --target erase
+     pio run --target upload
+     ```
+     On next boot the portal will appear as if it were the first boot.
+
+3. **Captive portal timeout** — The portal stays active for **3 minutes**. If no one connects and configures WiFi in that time, the board restarts and tries again. This prevents the board from being stuck in AP mode indefinitely.
+
+### WiFi Tips
+
+- The ESP32-S3 supports **2.4 GHz only** — it cannot connect to 5 GHz networks.
+- Place the board within reasonable range of your access point. Check signal strength via `GET /status` (the `rssi` field, in dBm). Anything above −70 dBm is fine.
+- If the board repeatedly fails to connect, check for MAC filtering on your router or try a simpler SSID (avoid special characters).
+- The board's hostname on the network is `esp32-birdnet` — you can find it in your router's DHCP client list or via mDNS as `esp32-birdnet.local`.
+
+### Build-Time WiFi Credentials (Skip Captive Portal)
+
+If you want the board to connect to a known network without going through the captive portal, you can bake the credentials into the firmware at compile time.
+
+In `platformio.ini`, uncomment and edit these lines:
+
+```ini
+build_flags =
+    -DBOARD_HAS_PSRAM
+    -DWIFI_SSID=\"YourNetworkName\"
+    -DWIFI_PASSWORD=\"YourPassword\"
+```
+
+Then build and flash:
+
+```bash
+pio run --target upload
+```
+
+When `WIFI_SSID` and `WIFI_PASSWORD` are defined, the board connects directly on boot — no AP, no portal. Other parameters (UDP host, sample rate, location, etc.) are still configurable via the HTTP API at runtime.
+
+To go back to captive portal mode, simply comment out or remove the two `-D` flags and reflash.
+
+## OTA (Over-The-Air) Updates
+
+Once the board is connected to your WiFi network you can push new firmware without USB.
+
+### Using PlatformIO CLI
+
+```bash
+# Upload over the network (replace IP with your board's IP)
+pio run --target upload --upload-port 192.168.1.xxx
+```
+
+Or add an OTA environment to `platformio.ini`:
+
+```ini
+[env:ota]
+extends = env:esp32-s3-devkitc1-n16r8
+upload_protocol = espota
+upload_port = 192.168.1.xxx   ; replace with board IP
+upload_flags =
+    --port=3232
+```
+
+Then simply:
+
+```bash
+pio run -e ota --target upload
+```
+
+### Using Arduino IDE
+
+1. In **Tools > Port**, select the network port labelled `esp32-birdnet (192.168.x.x)`.
+2. Upload as normal.
+
+### Finding the Board's IP
+
+- Check your router's DHCP client list for hostname `esp32-birdnet`.
+- Or read it from the serial monitor at boot:
+  ```
+  [WiFi] IP: 192.168.1.42
+  ```
+
+### OTA Notes
+
+- OTA is only available while the board is awake (sunrise−1h to sunset).
+- If the board is deep-sleeping you must wait until the next active window, or power-cycle it to trigger a fresh boot.
+- No authentication is configured by default. To add a password, call `ArduinoOTA.setPassword("your-password")` in `otaInit()`.
+
+## Sleep Schedule
+
+The board calculates local sunrise and sunset times using the configured coordinates. It is active from **1 hour before sunrise** until **sunset**, then enters deep sleep until the next morning's active window.
+
+During deep sleep the ESP32-S3 draws ~7 µA, making this suitable for solar/battery deployments.
+
+## mDNS (Network Discovery)
+
+The board advertises itself on the local network via mDNS (Bonjour/Avahi) as:
+
+```
+esp32-birdnet.local
+```
+
+This means you can:
+
+- Access the config page at `http://esp32-birdnet.local/config`
+- Push OTA updates to `esp32-birdnet.local`
+- Use mDNS hostnames as the UDP target (e.g. `my-server.local`)
+
+### Advertised Services
+
+| Service         | Protocol | Port            | Description            |
+| --------------- | -------- | --------------- | ---------------------- |
+| `_http._tcp`    | TCP      | 80              | HTTP configuration API |
+| `_birdnet._udp` | UDP      | configured port | Audio stream source    |
+
+### Using mDNS for the UDP Target
+
+Instead of a numeric IP, you can set the UDP Host to a `.local` hostname in the captive portal or via the HTTP API:
+
+```bash
+# Point audio at a machine advertising itself as "birdnet-server.local"
+curl -X POST "http://esp32-birdnet.local/config" \
+     -d "udp_host=birdnet-server.local"
+```
+
+The board resolves `.local` names using mDNS and caches the result, re-resolving every 60 seconds. Regular hostnames fall back to DNS.
+
+### Requirements
+
+mDNS works out of the box on:
+- macOS (Bonjour built-in)
+- Linux (install `avahi-daemon` if not already present)
+- Windows 10+ (mDNS support built-in for `.local` domains)
+
+## Remote Configuration API
+
+The board runs a lightweight HTTP server on port 80 for runtime configuration.
+
+### GET /status
+
+Returns current device status:
+
+```bash
+curl http://esp32-birdnet.local/status
+```
+
+```json
+{
+  "time": "2025-06-15 07:23:01",
+  "sunrise": "05:14",
+  "sunset": "20:51",
+  "sleep_enabled": true,
+  "ip": "192.168.1.42",
+  "rssi": -54
+}
+```
+
+### GET /config
+
+Returns current configuration:
+
+```bash
+curl http://esp32-birdnet.local/config
+```
+
+```json
+{
+  "udp_host": "192.168.1.100",
+  "udp_port": 4000,
+  "latitude": "45.4215",
+  "longitude": "-75.6972",
+  "utc_offset": "-5",
+  "sleep_enabled": true
+}
+```
+
+### POST /config
+
+Update one or more parameters. Changes are saved to flash immediately.
+
+```bash
+# Change UDP target
+curl -X POST "http://esp32-birdnet.local/config" \
+     -d "udp_host=birdnet-server.local&udp_port=5000"
+
+# Change sample rate (triggers automatic reboot)
+curl -X POST "http://esp32-birdnet.local/config" \
+     -d "sample_rate=48000"
+
+# Disable sleep (board stays on 24/7)
+curl -X POST "http://esp32-birdnet.local/config" \
+     -d "sleep_enabled=false"
+
+# Re-enable sleep
+curl -X POST "http://esp32-birdnet.local/config" \
+     -d "sleep_enabled=true"
+```
+
+Available parameters: `udp_host`, `udp_port`, `sample_rate`, `latitude`, `longitude`, `utc_offset`, `sleep_enabled` (true/false).
+
+Allowed sample rates: `8000`, `16000`, `22050`, `32000`, `44100`, `48000` Hz. Changing the sample rate requires an I2S driver reinit, so the board reboots automatically.
+
+## UDP Audio Format
+
+| Parameter   | Value                                                                    |
+| ----------- | ------------------------------------------------------------------------ |
+| Encoding    | Raw PCM (little-endian)                                                  |
+| Sample rate | Configurable: 8000, 16000, 22050, 32000, 44100, 48000 Hz (default 48000) |
+| Bit depth   | 16-bit signed                                                            |
+| Channels    | 1 (mono)                                                                 |
+| Packet size | ≤ 1024 bytes                                                             |
+
+## License
+
+See [LICENSE](LICENSE) for details.
