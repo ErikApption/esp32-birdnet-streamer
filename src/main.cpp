@@ -10,6 +10,7 @@
 #include <time.h>
 #include <sunset.h>
 #include <esp_system.h>
+#include <opus.h>
 
 // ─── I2S Configuration ───────────────────────────────────────────────────────
 #define I2S_WS_PIN        5   // Word Select (LRCLK)
@@ -20,12 +21,18 @@
 #define DEFAULT_SAMPLE_RATE 48000
 #define SAMPLE_BITS       I2S_BITS_PER_SAMPLE_16BIT
 #define I2S_CHANNEL_FMT   I2S_CHANNEL_FMT_ONLY_LEFT
-#define DMA_BUF_COUNT     4
+#define DMA_BUF_COUNT     8
 #define DMA_BUF_LEN       1024
 
 // ─── UDP Configuration ───────────────────────────────────────────────────────
 #define DEFAULT_UDP_HOST  "192.168.1.100"
 #define DEFAULT_UDP_PORT  4000
+
+// ─── Opus Encoder Configuration ─────────────────────────────────────────────
+#define OPUS_FRAME_MS         60    // 60ms frames — maximum efficiency, fewer packets
+#define OPUS_BITRATE_BPS      64000 // 64 kbps — good quality for bird audio
+#define OPUS_COMPLEXITY_LEVEL 5     // 0-10, higher = better quality but more CPU
+#define OPUS_FRAMES_PER_PACKET 4    // Bundle 4 frames per UDP packet (240ms per packet)
 
 // ─── Location defaults (used for sunrise/sunset calculation) ─────────────────
 #define DEFAULT_LATITUDE   "45.4215"
@@ -55,6 +62,24 @@ bool configured     = false;  // true once a config has been received (persisted
 
 static int16_t i2sBuffer[DMA_BUF_LEN];
 
+// ─── Opus Encoder Globals ────────────────────────────────────────────────────
+OpusEncoder *opusEncoder = nullptr;
+int opusFrameSamples = 0;            // samples per Opus frame (sampleRate * OPUS_FRAME_MS / 1000)
+int16_t *opusInputBuffer = nullptr;  // accumulator for one Opus frame (PSRAM — large, write-only)
+int opusInputIndex = 0;              // current fill level in opusInputBuffer
+uint8_t *opusOutputBuffer = nullptr; // encoded output buffer (internal RAM — fast access)
+#define OPUS_MAX_FRAME_SIZE 1275     // max Opus frame size per spec
+
+// Multi-frame UDP packet buffer: [header][len1][frame1][len2][frame2]...
+// Header: 4 bytes — [0x4F 0x50] magic, [1 byte frame count], [1 byte sequence number]
+// Each frame: 2 bytes big-endian length + encoded data
+uint8_t *udpPacketBuffer = nullptr;  // assembled multi-frame UDP packet (internal RAM)
+int udpPacketOffset = 0;             // current write position in packet buffer
+int udpPacketFrameCount = 0;         // frames accumulated in current packet
+uint8_t udpSequenceNumber = 0;       // wrapping sequence counter for packet ordering
+#define UDP_PACKET_HEADER_SIZE 4     // magic(2) + frame_count(1) + seq(1)
+#define UDP_PACKET_BUF_SIZE 1400     // stay well under MTU (1500 - 20 IP - 8 UDP = 1472)
+
 // ─── mDNS Hostname ───────────────────────────────────────────────────────────
 #define MDNS_HOSTNAME     "esp32-birdnet"
 #define MDNS_SERVICE      "birdnet"
@@ -63,7 +88,9 @@ static int16_t i2sBuffer[DMA_BUF_LEN];
 void wifiInit();
 void otaInit();
 void i2sInit();
+void opusInit();
 void udpInit();
+void flushUdpPacket(uint16_t port);
 void httpInit();
 void mdnsInit();
 void startStreaming();
@@ -284,6 +311,9 @@ void mdnsInit() {
     uint16_t port = (uint16_t)atoi(udpPort);
     MDNS.addService(MDNS_SERVICE, "udp", port);
     MDNS.addServiceTxt(MDNS_SERVICE, "udp", "rate", String(sampleRateStr));
+    MDNS.addServiceTxt(MDNS_SERVICE, "udp", "codec", "opus");
+    MDNS.addServiceTxt(MDNS_SERVICE, "udp", "frame_ms", String(OPUS_FRAME_MS));
+    MDNS.addServiceTxt(MDNS_SERVICE, "udp", "frames_per_pkt", String(OPUS_FRAMES_PER_PACKET));
     MDNS.addServiceTxt(MDNS_SERVICE, "udp", "version", "1.0");
 
     Serial.printf("[mDNS] Hostname  : %s.local\n", MDNS_HOSTNAME);
@@ -357,6 +387,45 @@ void i2sInit() {
 
     i2s_zero_dma_buffer(I2S_PORT);
     Serial.println("[I2S] Initialized");
+}
+
+// ─── Opus Encoder Setup ──────────────────────────────────────────────────────
+void opusInit() {
+    opusFrameSamples = sampleRate * OPUS_FRAME_MS / 1000;
+
+    // Input buffer in PSRAM (large, sequential writes only)
+    opusInputBuffer = (int16_t*)ps_malloc(sizeof(int16_t) * opusFrameSamples);
+    // Output and packet buffers in internal RAM for fast random access during encoding/framing
+    opusOutputBuffer = (uint8_t*)malloc(OPUS_MAX_FRAME_SIZE);
+    udpPacketBuffer = (uint8_t*)malloc(UDP_PACKET_BUF_SIZE);
+
+    if (!opusInputBuffer || !opusOutputBuffer || !udpPacketBuffer) {
+        Serial.println("[Opus] ERROR: Failed to allocate buffers!");
+        return;
+    }
+
+    opusInputIndex = 0;
+    udpPacketOffset = UDP_PACKET_HEADER_SIZE;  // reserve header space
+    udpPacketFrameCount = 0;
+    udpSequenceNumber = 0;
+
+    int error;
+    opusEncoder = opus_encoder_create(sampleRate, 1, OPUS_APPLICATION_AUDIO, &error);
+    if (error != OPUS_OK || !opusEncoder) {
+        Serial.printf("[Opus] ERROR: Failed to create encoder (error %d)\n", error);
+        return;
+    }
+
+    opus_encoder_ctl(opusEncoder, OPUS_SET_BITRATE(OPUS_BITRATE_BPS));
+    opus_encoder_ctl(opusEncoder, OPUS_SET_COMPLEXITY(OPUS_COMPLEXITY_LEVEL));
+    opus_encoder_ctl(opusEncoder, OPUS_SET_SIGNAL(OPUS_SIGNAL_MUSIC));
+    // Enable DTX (discontinuous transmission) — saves bandwidth during silence
+    opus_encoder_ctl(opusEncoder, OPUS_SET_DTX(1));
+
+    Serial.printf("[Opus] Encoder initialized — %d Hz, %d ms frames (%d samples), %d bps\n",
+        sampleRate, OPUS_FRAME_MS, opusFrameSamples, OPUS_BITRATE_BPS);
+    Serial.printf("[Opus] Bundling %d frames/packet (%d ms per UDP packet)\n",
+        OPUS_FRAMES_PER_PACKET, OPUS_FRAME_MS * OPUS_FRAMES_PER_PACKET);
 }
 
 // ─── OTA Setup ───────────────────────────────────────────────────────────────
@@ -654,57 +723,111 @@ void streamAudio() {
         return; // Can't send if host is unresolved
     }
 
+    if (!opusEncoder) {
+        return; // Encoder not initialized
+    }
+
     uint16_t port = (uint16_t)atoi(udpPort);
+    int samplesRead = bytesRead / sizeof(int16_t);
 
-    // Send the entire I2S buffer in one UDP packet (max ~1460 bytes safe for
-    // Ethernet MTU). DMA_BUF_LEN=1024 samples × 2 bytes = 2048 bytes, which
-    // exceeds typical MTU, so we split into chunks that fit without IP fragmentation.
-    const size_t maxPacket = 1440;  // safe for standard 1500 MTU minus headers
-    size_t offset = 0;
+    // Feed PCM samples into Opus frame accumulator and encode when full
+    int offset = 0;
+    while (offset < samplesRead) {
+        int remaining = opusFrameSamples - opusInputIndex;
+        int available = samplesRead - offset;
+        int toCopy = min(remaining, available);
 
-    while (offset < bytesRead) {
-        size_t chunkSize = min(maxPacket, bytesRead - offset);
+        memcpy(&opusInputBuffer[opusInputIndex], &i2sBuffer[offset], toCopy * sizeof(int16_t));
+        opusInputIndex += toCopy;
+        offset += toCopy;
 
-        if (!udp.beginPacket(resolvedUdpAddr, port)) {
-            // Socket not ready — back off briefly and skip this cycle
-            delay(1);
-            return;
-        }
-        udp.write((uint8_t*)i2sBuffer + offset, chunkSize);
-        int sent = udp.endPacket();
+        // When we've accumulated a full Opus frame, encode it
+        if (opusInputIndex >= opusFrameSamples) {
+            int encodedBytes = opus_encode(opusEncoder, opusInputBuffer, opusFrameSamples,
+                                           opusOutputBuffer, OPUS_MAX_FRAME_SIZE);
+            opusInputIndex = 0;
 
-        if (sent) {
-            if (!udpFirstPacketLogged) {
-                Serial.printf("[UDP] First packet sent OK (%u bytes to %s:%d)\n",
-                    chunkSize, resolvedUdpAddr.toString().c_str(), port);
-                udpFirstPacketLogged = true;
+            if (encodedBytes <= 0) {
+                // Opus encoding error — skip this frame
+                continue;
             }
-        } else {
-            udpSendErrors++;
-            // Only log occasionally to avoid flooding serial
-            if (udpSendErrors == 1 || udpSendErrors == 100 || udpSendErrors == 1000 ||
-                udpSendErrors % 10000 == 0) {
-                Serial.printf("[UDP] Send failed (total errors: %lu) — buffer pressure\n",
-                    udpSendErrors);
+
+            // Check if this frame fits in the current packet buffer
+            int needed = 2 + encodedBytes;
+            if (udpPacketOffset + needed > UDP_PACKET_BUF_SIZE) {
+                // Flush current packet first, then start a new one with this frame
+                flushUdpPacket(port);
             }
-            // Back off to let the network stack drain its buffers
-            delay(2);
-            return;  // Drop remaining chunks this cycle, I2S will refill next call
-        }
 
-        offset += chunkSize;
+            // Append encoded frame: [2-byte big-endian length][frame data]
+            udpPacketBuffer[udpPacketOffset++] = (uint8_t)(encodedBytes >> 8);
+            udpPacketBuffer[udpPacketOffset++] = (uint8_t)(encodedBytes & 0xFF);
+            memcpy(&udpPacketBuffer[udpPacketOffset], opusOutputBuffer, encodedBytes);
+            udpPacketOffset += encodedBytes;
+            udpPacketFrameCount++;
 
-        // Small yield between chunks so lwIP can process TX completions
-        if (offset < bytesRead) {
-            yield();
+            // Flush when we've accumulated the target number of frames
+            if (udpPacketFrameCount >= OPUS_FRAMES_PER_PACKET) {
+                flushUdpPacket(port);
+            }
         }
     }
+}
+
+// Send the assembled multi-frame packet over UDP
+void flushUdpPacket(uint16_t port) {
+    if (udpPacketFrameCount == 0) return;
+
+    // Write header: magic bytes + frame count + sequence number
+    udpPacketBuffer[0] = 0x4F;  // 'O'
+    udpPacketBuffer[1] = 0x50;  // 'P'
+    udpPacketBuffer[2] = (uint8_t)udpPacketFrameCount;
+    udpPacketBuffer[3] = udpSequenceNumber++;
+
+    if (!udp.beginPacket(resolvedUdpAddr, port)) {
+        delay(1);
+        udpPacketOffset = UDP_PACKET_HEADER_SIZE;
+        udpPacketFrameCount = 0;
+        return;
+    }
+    udp.write(udpPacketBuffer, udpPacketOffset);
+    int sent = udp.endPacket();
+
+    if (sent) {
+        if (!udpFirstPacketLogged) {
+            Serial.printf("[UDP] First packet sent (%d bytes, %d frames, %d ms to %s:%d)\n",
+                udpPacketOffset, udpPacketFrameCount,
+                OPUS_FRAME_MS * udpPacketFrameCount,
+                resolvedUdpAddr.toString().c_str(), port);
+            udpFirstPacketLogged = true;
+        }
+    } else {
+        udpSendErrors++;
+        if (udpSendErrors == 1 || udpSendErrors == 100 || udpSendErrors == 1000 ||
+            udpSendErrors % 10000 == 0) {
+            Serial.printf("[UDP] Send failed (total errors: %lu)\n", udpSendErrors);
+        }
+        delay(2);
+    }
+
+    // Reset for next packet
+    udpPacketOffset = UDP_PACKET_HEADER_SIZE;
+    udpPacketFrameCount = 0;
 }
 
 // ─── Main ────────────────────────────────────────────────────────────────────
 #define SCHEDULE_CHECK_INTERVAL_MS  (5 * 60 * 1000)
 unsigned long lastScheduleCheck = 0;
 bool streamingStarted = false;
+TaskHandle_t audioTaskHandle = nullptr;
+
+// ─── Audio Task (runs on dedicated core with large stack) ────────────────────
+void audioTask(void *param) {
+    Serial.println("[Audio] Task started on core " + String(xPortGetCoreID()));
+    for (;;) {
+        streamAudio();
+    }
+}
 
 void startStreaming() {
     if (streamingStarted) return;
@@ -722,7 +845,20 @@ void startStreaming() {
 
     Serial.println("[Schedule] Within active window — starting audio services");
     i2sInit();
+    opusInit();
     udpInit();
+
+    // Launch audio streaming on a dedicated task with 32KB stack
+    // Pinned to core 1 to avoid contention with WiFi (core 0)
+    xTaskCreatePinnedToCore(
+        audioTask,          // task function
+        "audio_stream",     // name
+        32768,              // stack size (bytes) — Opus encoder needs deep stack
+        NULL,               // parameter
+        5,                  // priority (above normal)
+        &audioTaskHandle,   // handle
+        1                   // core 1
+    );
 
     streamingStarted = true;
     lastScheduleCheck = millis();
@@ -778,11 +914,8 @@ void loop() {
         startStreaming();
     }
 
-    // Only stream audio if fully configured and started
+    // Periodically check if we've passed sunset
     if (streamingStarted) {
-        streamAudio();
-
-        // Periodically check if we've passed sunset
         if (millis() - lastScheduleCheck >= SCHEDULE_CHECK_INTERVAL_MS) {
             lastScheduleCheck = millis();
 
@@ -793,4 +926,6 @@ void loop() {
             }
         }
     }
+
+    delay(10); // Yield time — audio runs on its own task
 }
