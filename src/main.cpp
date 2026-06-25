@@ -9,6 +9,7 @@
 #include <driver/i2s.h>
 #include <time.h>
 #include <sunset.h>
+#include <esp_system.h>
 
 // ─── I2S Configuration ───────────────────────────────────────────────────────
 #define I2S_WS_PIN        5   // Word Select (LRCLK)
@@ -47,9 +48,10 @@ char udpPort[6]     = "4000";
 char latitude[12]   = DEFAULT_LATITUDE;
 char longitude[12]  = DEFAULT_LONGITUDE;
 char utcOffset[4]   = DEFAULT_UTC_OFFSET;
-bool sleepEnabled   = true;
+bool sleepEnabled   = false;
 uint32_t sampleRate = DEFAULT_SAMPLE_RATE;
 char sampleRateStr[8] = "48000";
+bool configured     = false;  // true once a config has been received (persisted in NVS)
 
 static int16_t i2sBuffer[DMA_BUF_LEN];
 
@@ -61,8 +63,10 @@ static int16_t i2sBuffer[DMA_BUF_LEN];
 void wifiInit();
 void otaInit();
 void i2sInit();
+void udpInit();
 void httpInit();
 void mdnsInit();
+void startStreaming();
 IPAddress resolveHost(const char* hostname);
 void streamAudio();
 void enterDeepSleep(uint64_t sleepSeconds);
@@ -99,6 +103,7 @@ void loadSettings() {
     String uo = prefs.getString("utcOffset", DEFAULT_UTC_OFFSET);
     sleepEnabled = prefs.getBool("sleepOn", true);
     sampleRate = prefs.getUInt("sampleRate", DEFAULT_SAMPLE_RATE);
+    configured = prefs.getBool("configured", false);
     prefs.end();
 
     strncpy(udpHost, h.c_str(), sizeof(udpHost) - 1);
@@ -107,6 +112,8 @@ void loadSettings() {
     strncpy(longitude, lo.c_str(), sizeof(longitude) - 1);
     strncpy(utcOffset, uo.c_str(), sizeof(utcOffset) - 1);
     snprintf(sampleRateStr, sizeof(sampleRateStr), "%lu", (unsigned long)sampleRate);
+
+    Serial.printf("[NVS] Configured: %s\n", configured ? "yes" : "no");
 }
 
 void saveSettings() {
@@ -118,12 +125,14 @@ void saveSettings() {
     prefs.putString("utcOffset", utcOffset);
     prefs.putBool("sleepOn", sleepEnabled);
     prefs.putUInt("sampleRate", sampleRate);
+    prefs.putBool("configured", configured);
     prefs.end();
 }
 
 // ─── WiFiManager save callback ───────────────────────────────────────────────
 void saveParamsCallback() {
-    Serial.println("[WiFiManager] Parameters saved");
+    configured = true;
+    Serial.println("[WiFiManager] Parameters saved — device configured");
 }
 
 // ─── HTTP Configuration Server ───────────────────────────────────────────────
@@ -135,7 +144,8 @@ void handleGetConfig() {
     json += "\"latitude\":\"" + String(latitude) + "\",";
     json += "\"longitude\":\"" + String(longitude) + "\",";
     json += "\"utc_offset\":\"" + String(utcOffset) + "\",";
-    json += "\"sleep_enabled\":" + String(sleepEnabled ? "true" : "false");
+    json += "\"sleep_enabled\":" + String(sleepEnabled ? "true" : "false") + ",";
+    json += "\"configured\":" + String(configured ? "true" : "false");
     json += "}";
     server.send(200, "application/json", json);
 }
@@ -184,6 +194,7 @@ void handlePostConfig() {
     }
 
     if (changed) {
+        configured = true;
         saveSettings();
         Serial.printf("[HTTP] Config updated — UDP: %s:%s, rate: %lu, sleep: %s\n",
             udpHost, udpPort, (unsigned long)sampleRate, sleepEnabled ? "on" : "off");
@@ -250,6 +261,8 @@ void httpInit() {
 
 // ─── mDNS Setup ──────────────────────────────────────────────────────────────
 void mdnsInit() {
+    Serial.println("[mDNS] Starting mDNS responder...");
+
     // Give the WiFi stack time to fully stabilize before starting mDNS
     delay(200);
 
@@ -257,17 +270,25 @@ void mdnsInit() {
         Serial.println("[mDNS] Failed to start — retrying once...");
         delay(1000);
         if (!MDNS.begin(MDNS_HOSTNAME)) {
-            Serial.println("[mDNS] Failed to start on retry");
+            Serial.println("[mDNS] FAILED to start on retry — mDNS unavailable");
             return;
         }
     }
 
-    // Advertise HTTP config server
+    // Advertise HTTP config server with descriptive TXT records
     MDNS.addService("http", "tcp", HTTP_PORT);
-    // Advertise custom birdnet service so receivers can discover us
-    MDNS.addService(MDNS_SERVICE, "udp", (uint16_t)atoi(udpPort));
+    MDNS.addServiceTxt("http", "tcp", "path", "/config");
+    MDNS.addServiceTxt("http", "tcp", "device", "ESP32-BirdNet-Streamer");
 
-    Serial.printf("[mDNS] Advertising as %s.local\n", MDNS_HOSTNAME);
+    // Advertise custom birdnet service so receivers can discover us
+    uint16_t port = (uint16_t)atoi(udpPort);
+    MDNS.addService(MDNS_SERVICE, "udp", port);
+    MDNS.addServiceTxt(MDNS_SERVICE, "udp", "rate", String(sampleRateStr));
+    MDNS.addServiceTxt(MDNS_SERVICE, "udp", "version", "1.0");
+
+    Serial.printf("[mDNS] Hostname  : %s.local\n", MDNS_HOSTNAME);
+    Serial.printf("[mDNS] Services  : http/tcp:%d, %s/udp:%d\n", HTTP_PORT, MDNS_SERVICE, port);
+    Serial.printf("[mDNS] Access URL: http://%s.local/config\n", MDNS_HOSTNAME);
 }
 
 // ─── Resolve hostname (supports .local mDNS names and regular IPs) ──────────
@@ -370,12 +391,20 @@ void otaInit() {
 
 // ─── WiFi Setup via WiFiManager ──────────────────────────────────────────────
 void wifiInit() {
-    // Set hostname before connecting — required for mDNS to work reliably
+    Serial.println("[WiFi] Initializing...");
+
+    // Set hostname BEFORE WiFi.mode() and WiFi.begin() — this is what the
+    // DHCP client sends to the router so the device shows up with a
+    // human-readable name in the router's client list.
     WiFi.setHostname(MDNS_HOSTNAME);
+    Serial.printf("[WiFi] Hostname set to: %s\n", MDNS_HOSTNAME);
+
+    // Print MAC address early — useful for identifying the device on the router
+    Serial.printf("[WiFi] MAC Address: %s\n", WiFi.macAddress().c_str());
 
 #if defined(WIFI_SSID) && defined(WIFI_PASSWORD)
     // Compile-time credentials provided — try connecting directly first
-    Serial.printf("[WiFi] Connecting to %s (build-time credentials)...\n", WIFI_SSID);
+    Serial.printf("[WiFi] Connecting to '%s' (build-time credentials)...\n", WIFI_SSID);
     WiFi.mode(WIFI_STA);
     WiFi.begin(WIFI_SSID, WIFI_PASSWORD);
 
@@ -388,14 +417,20 @@ void wifiInit() {
     Serial.println();
 
     if (WiFi.status() != WL_CONNECTED) {
-        Serial.println("[WiFi] Build-time credentials failed — falling back to captive portal");
+        Serial.printf("[WiFi] Build-time credentials failed (status=%d) — falling back to captive portal\n",
+            WiFi.status());
         WiFi.disconnect(true);
+        delay(100);
     }
 #endif
 
     // If not yet connected (no build-time creds, or they failed), use WiFiManager
     if (WiFi.status() != WL_CONNECTED) {
+        Serial.println("[WiFi] Starting WiFiManager captive portal...");
         WiFiManager wm;
+
+        // Set WiFiManager hostname so it also propagates during portal mode
+        wm.setHostname(MDNS_HOSTNAME);
 
         WiFiManagerParameter customUdpHost("udp_host", "UDP Host", udpHost, sizeof(udpHost));
         WiFiManagerParameter customUdpPort("udp_port", "UDP Port", udpPort, sizeof(udpPort));
@@ -417,7 +452,7 @@ void wifiInit() {
         bool connected = wm.autoConnect("BirdNet-Setup");
 
         if (!connected) {
-            Serial.println("[WiFi] Failed to connect — restarting");
+            Serial.println("[WiFi] Failed to connect — restarting in 3s");
             delay(3000);
             ESP.restart();
         }
@@ -450,11 +485,26 @@ void wifiInit() {
         saveSettings();
     }
 
-    Serial.println("[WiFi] Connected");
-    Serial.printf("[WiFi] IP: %s\n", WiFi.localIP().toString().c_str());
-    Serial.printf("[UDP] Target: %s:%s\n", udpHost, udpPort);
-    Serial.printf("[Audio] Sample rate: %lu Hz\n", (unsigned long)sampleRate);
-    Serial.printf("[Location] Lat: %s  Lon: %s  UTC%s\n", latitude, longitude, utcOffset);
+    // ─── Connection established — print full network details ─────────────────
+    Serial.println("[WiFi] ╔══════════════════════════════════════════════╗");
+    Serial.println("[WiFi] ║         CONNECTED SUCCESSFULLY              ║");
+    Serial.println("[WiFi] ╚══════════════════════════════════════════════╝");
+    Serial.printf("[WiFi]   SSID       : %s\n", WiFi.SSID().c_str());
+    Serial.printf("[WiFi]   IP Address : %s\n", WiFi.localIP().toString().c_str());
+    Serial.printf("[WiFi]   Subnet Mask: %s\n", WiFi.subnetMask().toString().c_str());
+    Serial.printf("[WiFi]   Gateway    : %s\n", WiFi.gatewayIP().toString().c_str());
+    Serial.printf("[WiFi]   DNS        : %s\n", WiFi.dnsIP().toString().c_str());
+    Serial.printf("[WiFi]   MAC Address: %s\n", WiFi.macAddress().c_str());
+    Serial.printf("[WiFi]   Hostname   : %s\n", WiFi.getHostname());
+    Serial.printf("[WiFi]   RSSI       : %d dBm\n", WiFi.RSSI());
+    Serial.printf("[WiFi]   Channel    : %d\n", WiFi.channel());
+    Serial.printf("[WiFi]   TX Power   : %d\n", WiFi.getTxPower());
+    Serial.println("[WiFi] ──────────────────────────────────────────────");
+    Serial.printf("[Config] UDP Target   : %s:%s\n", udpHost, udpPort);
+    Serial.printf("[Config] Sample Rate  : %lu Hz\n", (unsigned long)sampleRate);
+    Serial.printf("[Config] Location     : Lat %s, Lon %s, UTC%s\n", latitude, longitude, utcOffset);
+    Serial.printf("[Config] Sleep Enabled: %s\n", sleepEnabled ? "yes" : "no");
+    Serial.println("[WiFi] ──────────────────────────────────────────────");
 }
 
 // ─── NTP Time Sync ───────────────────────────────────────────────────────────
@@ -567,7 +617,20 @@ void enterDeepSleep(uint64_t sleepSeconds) {
 // Cached resolved UDP target IP (re-resolved periodically or on config change)
 IPAddress resolvedUdpAddr;
 unsigned long lastResolveTime = 0;
+unsigned long udpSendErrors = 0;
+bool udpFirstPacketLogged = false;
 #define RESOLVE_INTERVAL_MS  (60 * 1000)  // re-resolve every 60s
+
+void udpInit() {
+    // Bind the UDP socket to a local port (0 = system picks an ephemeral port).
+    // This MUST be called before beginPacket/endPacket or sends will fail with ENOMEM.
+    if (udp.begin(0)) {
+        Serial.println("[UDP] Socket bound successfully");
+    } else {
+        Serial.println("[UDP] ERROR: Failed to bind socket!");
+    }
+    Serial.printf("[UDP] Target: %s:%s\n", udpHost, udpPort);
+}
 
 void streamAudio() {
     size_t bytesRead = 0;
@@ -582,6 +645,9 @@ void streamAudio() {
         millis() - lastResolveTime >= RESOLVE_INTERVAL_MS) {
         resolvedUdpAddr = resolveHost(udpHost);
         lastResolveTime = millis();
+        if (resolvedUdpAddr != IPAddress(0, 0, 0, 0)) {
+            Serial.printf("[UDP] Resolved target: %s -> %s\n", udpHost, resolvedUdpAddr.toString().c_str());
+        }
     }
 
     if (resolvedUdpAddr == IPAddress(0, 0, 0, 0)) {
@@ -590,31 +656,60 @@ void streamAudio() {
 
     uint16_t port = (uint16_t)atoi(udpPort);
 
-    const size_t maxPacket = 1024;
+    // Send the entire I2S buffer in one UDP packet (max ~1460 bytes safe for
+    // Ethernet MTU). DMA_BUF_LEN=1024 samples × 2 bytes = 2048 bytes, which
+    // exceeds typical MTU, so we split into chunks that fit without IP fragmentation.
+    const size_t maxPacket = 1440;  // safe for standard 1500 MTU minus headers
     size_t offset = 0;
 
     while (offset < bytesRead) {
         size_t chunkSize = min(maxPacket, bytesRead - offset);
-        udp.beginPacket(resolvedUdpAddr, port);
+
+        if (!udp.beginPacket(resolvedUdpAddr, port)) {
+            // Socket not ready — back off briefly and skip this cycle
+            delay(1);
+            return;
+        }
         udp.write((uint8_t*)i2sBuffer + offset, chunkSize);
-        udp.endPacket();
+        int sent = udp.endPacket();
+
+        if (sent) {
+            if (!udpFirstPacketLogged) {
+                Serial.printf("[UDP] First packet sent OK (%u bytes to %s:%d)\n",
+                    chunkSize, resolvedUdpAddr.toString().c_str(), port);
+                udpFirstPacketLogged = true;
+            }
+        } else {
+            udpSendErrors++;
+            // Only log occasionally to avoid flooding serial
+            if (udpSendErrors == 1 || udpSendErrors == 100 || udpSendErrors == 1000 ||
+                udpSendErrors % 10000 == 0) {
+                Serial.printf("[UDP] Send failed (total errors: %lu) — buffer pressure\n",
+                    udpSendErrors);
+            }
+            // Back off to let the network stack drain its buffers
+            delay(2);
+            return;  // Drop remaining chunks this cycle, I2S will refill next call
+        }
+
         offset += chunkSize;
+
+        // Small yield between chunks so lwIP can process TX completions
+        if (offset < bytesRead) {
+            yield();
+        }
     }
 }
 
 // ─── Main ────────────────────────────────────────────────────────────────────
 #define SCHEDULE_CHECK_INTERVAL_MS  (5 * 60 * 1000)
 unsigned long lastScheduleCheck = 0;
+bool streamingStarted = false;
 
-void setup() {
-    Serial.begin(115200);
-    delay(1000);
-    Serial.println("\n[Boot] ESP32 BirdNet Streamer");
+void startStreaming() {
+    if (streamingStarted) return;
 
-    // Load saved settings from NVS before WiFi (so portal shows current values)
-    loadSettings();
-
-    wifiInit();
+    Serial.println("[Boot] Configuration received — starting audio streaming");
     syncTime();
 
     // Check schedule — go to sleep if outside window and sleep is enabled
@@ -625,29 +720,77 @@ void setup() {
         // Never reaches here
     }
 
-    Serial.println("[Schedule] Within active window — starting services");
+    Serial.println("[Schedule] Within active window — starting audio services");
+    i2sInit();
+    udpInit();
+
+    streamingStarted = true;
+    lastScheduleCheck = millis();
+    Serial.println("──────────────────────────────────────────────────");
+    Serial.println("[Boot] Streaming audio");
+    Serial.printf("[Boot] Free Heap: %lu bytes\n", (unsigned long)ESP.getFreeHeap());
+    Serial.println("══════════════════════════════════════════════════\n");
+}
+
+void setup() {
+    Serial.begin(115200);
+    delay(1000);
+    Serial.println("\n══════════════════════════════════════════════════");
+    Serial.println("       ESP32 BirdNet Streamer — Booting");
+    Serial.println("══════════════════════════════════════════════════");
+    Serial.printf("[Boot] CPU Freq     : %d MHz\n", getCpuFrequencyMhz());
+    Serial.printf("[Boot] Free Heap    : %lu bytes\n", (unsigned long)ESP.getFreeHeap());
+    Serial.printf("[Boot] Flash Size   : %lu bytes\n", (unsigned long)ESP.getFlashChipSize());
+    Serial.printf("[Boot] SDK Version  : %s\n", ESP.getSdkVersion());
+    Serial.printf("[Boot] Chip Model   : %s Rev %d\n", ESP.getChipModel(), ESP.getChipRevision());
+    Serial.printf("[Boot] Reset Reason : %d\n", (int)esp_reset_reason());
+    Serial.println("──────────────────────────────────────────────────");
+
+    // Load saved settings from NVS before WiFi (so portal shows current values)
+    loadSettings();
+
+    wifiInit();
+
+    // Always start OTA, mDNS, and HTTP so the device is discoverable
     otaInit();
     mdnsInit();
-    i2sInit();
     httpInit();
 
-    lastScheduleCheck = millis();
-    Serial.println("[Boot] Setup complete — streaming audio");
+    if (configured) {
+        // Device was previously configured — go straight to streaming
+        startStreaming();
+    } else {
+        // Not yet configured — wait in discovery mode
+        Serial.println("══════════════════════════════════════════════════");
+        Serial.println("[Boot] WAITING FOR CONFIGURATION");
+        Serial.printf("[Boot] Connect to http://%s.local/config to configure\n", MDNS_HOSTNAME);
+        Serial.printf("[Boot] Or POST to http://%s/config\n", WiFi.localIP().toString().c_str());
+        Serial.println("══════════════════════════════════════════════════");
+    }
 }
 
 void loop() {
     ArduinoOTA.handle();
     server.handleClient();
-    streamAudio();
 
-    // Periodically check if we've passed sunset
-    if (millis() - lastScheduleCheck >= SCHEDULE_CHECK_INTERVAL_MS) {
-        lastScheduleCheck = millis();
+    // If we just got configured, transition to streaming
+    if (configured && !streamingStarted) {
+        startStreaming();
+    }
 
-        if (sleepEnabled && !isWithinActiveWindow()) {
-            Serial.println("[Schedule] Active window ended — going to sleep");
-            uint64_t sleepSec = secondsUntilNextActiveWindow();
-            enterDeepSleep(sleepSec);
+    // Only stream audio if fully configured and started
+    if (streamingStarted) {
+        streamAudio();
+
+        // Periodically check if we've passed sunset
+        if (millis() - lastScheduleCheck >= SCHEDULE_CHECK_INTERVAL_MS) {
+            lastScheduleCheck = millis();
+
+            if (sleepEnabled && !isWithinActiveWindow()) {
+                Serial.println("[Schedule] Active window ended — going to sleep");
+                uint64_t sleepSec = secondsUntilNextActiveWindow();
+                enterDeepSleep(sleepSec);
+            }
         }
     }
 }
