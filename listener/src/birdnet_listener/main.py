@@ -176,10 +176,15 @@ class UDPReceiverProtocol(asyncio.DatagramProtocol):
     LOG_INTERVAL = 5.0  # seconds between status logs
     PACKET_MAGIC = b"OP"
     HEADER_SIZE = 4  # 2 bytes magic + 1 byte frame_count + 1 byte sequence_number
+    FRAME_SIZE = 2880  # 60ms at 48kHz mono (samples per frame)
+    LARGE_GAP_THRESHOLD = 128  # gaps larger than this are treated as reordering
 
-    def __init__(self, audio_buffer: AudioBuffer, opus_decoder: opuslib.Decoder):
+    def __init__(self, audio_buffer: AudioBuffer, opus_decoder: opuslib.Decoder,
+                 sample_rate: int = 48000, channels: int = 1):
         self.audio_buffer = audio_buffer
         self.opus_decoder = opus_decoder
+        self.sample_rate = sample_rate
+        self.channels = channels
         self.packets_received = 0
         self._receiving = False
         self._packets_since_last_log = 0
@@ -245,8 +250,16 @@ class UDPReceiverProtocol(asyncio.DatagramProtocol):
             if seq != self._expected_seq:
                 # Calculate how many packets were missed (handles wrap-around)
                 gap = (seq - self._expected_seq) & 0xFF
-                self._dropped_packets += gap
-                logger.debug(f"[UDP] Packet drop detected: expected seq {self._expected_seq}, got {seq} (gap={gap})")
+
+                if gap > self.LARGE_GAP_THRESHOLD:
+                    # Very large gap likely means reordering — treat as late/duplicate packet
+                    logger.debug(f"[UDP] Likely reordered packet: expected seq {self._expected_seq}, got {seq} (gap={gap})")
+                    return
+                else:
+                    # Genuine packet loss — reset decoder state for clean recovery
+                    self._dropped_packets += gap
+                    logger.debug(f"[UDP] Packet drop detected: expected seq {self._expected_seq}, got {seq} (gap={gap})")
+                    self.opus_decoder = opuslib.Decoder(self.sample_rate, self.channels)
         self._expected_seq = (seq + 1) & 0xFF
 
         # ─── Decode Opus frames ──────────────────────────────────────────
@@ -254,7 +267,7 @@ class UDPReceiverProtocol(asyncio.DatagramProtocol):
         offset = 0
 
         for i in range(frame_count):
-            # Each frame is preceded by a 2-byte little-endian length
+            # Each frame is preceded by a 2-byte big-endian length
             if offset + 2 > len(payload):
                 self._decode_errors += 1
                 if self._decode_errors <= 5:
@@ -274,8 +287,7 @@ class UDPReceiverProtocol(asyncio.DatagramProtocol):
             offset += frame_len
 
             try:
-                # frame_size=5760 supports up to 120ms at 48kHz (max Opus frame)
-                pcm = self.opus_decoder.decode(opus_frame, frame_size=5760)
+                pcm = self.opus_decoder.decode(opus_frame, frame_size=self.FRAME_SIZE)
                 self.audio_buffer.push(pcm)
                 if self.packets_received <= 3:
                     logger.info(f"[UDP] Decoded frame: {len(opus_frame)} bytes Opus -> {len(pcm)} bytes PCM")
@@ -395,7 +407,7 @@ def create_app(
         logger.info(f"Opus decoder initialized ({sample_rate} Hz, {channels}ch)")
 
         transport, udp_protocol = await loop.create_datagram_endpoint(
-            lambda: UDPReceiverProtocol(audio_buffer, opus_decoder),
+            lambda: UDPReceiverProtocol(audio_buffer, opus_decoder, sample_rate, channels),
             local_addr=("0.0.0.0", udp_port),
             family=socket.AF_INET,
         )

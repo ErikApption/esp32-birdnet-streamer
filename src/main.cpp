@@ -19,7 +19,7 @@
 #define I2S_PORT          I2S_NUM_0
 
 #define DEFAULT_SAMPLE_RATE 48000
-#define SAMPLE_BITS       I2S_BITS_PER_SAMPLE_16BIT
+#define SAMPLE_BITS       I2S_BITS_PER_SAMPLE_32BIT
 #define I2S_CHANNEL_FMT   I2S_CHANNEL_FMT_ONLY_LEFT
 #define DMA_BUF_COUNT     8
 #define DMA_BUF_LEN       1024
@@ -65,7 +65,8 @@ uint32_t sampleRate = DEFAULT_SAMPLE_RATE;
 char sampleRateStr[8] = "48000";
 bool configured     = false;  // true once a config has been received (persisted in NVS)
 
-static int16_t i2sBuffer[DMA_BUF_LEN];
+static int32_t i2sReadBuffer[DMA_BUF_LEN];  // 32-bit I2S read buffer
+static int16_t i2sBuffer[DMA_BUF_LEN];     // 16-bit samples after bit-shift conversion
 
 // ─── Opus Encoder Globals ────────────────────────────────────────────────────
 OpusEncoder *opusEncoder = nullptr;
@@ -379,7 +380,7 @@ void i2sInit() {
         .intr_alloc_flags = ESP_INTR_FLAG_LEVEL1,
         .dma_buf_count = DMA_BUF_COUNT,
         .dma_buf_len = DMA_BUF_LEN,
-        .use_apll = false,
+        .use_apll = true,
         .tx_desc_auto_clear = false,
         .fixed_mclk = 0
     };
@@ -726,9 +727,16 @@ void udpInit() {
 void streamAudio() {
     size_t bytesRead = 0;
 
-    esp_err_t err = i2s_read(I2S_PORT, i2sBuffer, sizeof(i2sBuffer), &bytesRead, portMAX_DELAY);
+    esp_err_t err = i2s_read(I2S_PORT, i2sReadBuffer, sizeof(i2sReadBuffer), &bytesRead, portMAX_DELAY);
     if (err != ESP_OK || bytesRead == 0) {
         return;
+    }
+
+    // Convert 32-bit I2S samples to 16-bit: MEMS mics output 24-bit data
+    // MSB-aligned in the 32-bit word, shift right to extract meaningful bits
+    int samplesRead32 = bytesRead / sizeof(int32_t);
+    for (int i = 0; i < samplesRead32; i++) {
+        i2sBuffer[i] = (int16_t)(i2sReadBuffer[i] >> 14);
     }
 
     // Re-resolve the UDP target periodically
@@ -750,7 +758,7 @@ void streamAudio() {
     }
 
     uint16_t port = (uint16_t)atoi(udpPort);
-    int samplesRead = bytesRead / sizeof(int16_t);
+    int samplesRead = samplesRead32;
 
     // Feed PCM samples into Opus frame accumulator and encode when full
     int offset = 0;
