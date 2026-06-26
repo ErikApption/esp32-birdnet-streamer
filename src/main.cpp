@@ -602,7 +602,25 @@ void wifiInit() {
 // ─── NTP Time Sync ───────────────────────────────────────────────────────────
 void syncTime() {
     int offset = atoi(utcOffset);
-    configTime(offset * 3600, 0, NTP_SERVER);
+
+    // Build a POSIX TZ string that includes DST (North American rules:
+    // DST starts 2nd Sunday of March, ends 1st Sunday of November).
+    // Standard offset is inverted in POSIX (UTC-5 becomes EST5EDT4).
+    // This ensures summer times are correct without requiring user to
+    // manually adjust the offset for DST.
+    char tzStr[64];
+    int absOffset = abs(offset);
+    int dstOffset = absOffset - 1;  // DST is 1 hour ahead (smaller UTC offset)
+
+    // POSIX TZ sign is inverted: west of UTC is positive in POSIX
+    int posixStdOffset = -offset;
+    int posixDstOffset = posixStdOffset - 1;
+
+    snprintf(tzStr, sizeof(tzStr), "STD%dDST%d,M3.2.0/2,M11.1.0/2",
+             posixStdOffset, posixDstOffset);
+
+    Serial.printf("[NTP] Timezone: %s (UTC%+d with DST)\n", tzStr, offset);
+    configTzTime(tzStr, NTP_SERVER);
 
     Serial.print("[NTP] Waiting for time sync");
     struct tm timeinfo;
@@ -620,9 +638,10 @@ void syncTime() {
         ESP.restart();
     }
 
-    Serial.printf("[NTP] Time: %04d-%02d-%02d %02d:%02d:%02d\n",
+    Serial.printf("[NTP] Time: %04d-%02d-%02d %02d:%02d:%02d (DST: %s)\n",
         timeinfo.tm_year + 1900, timeinfo.tm_mon + 1, timeinfo.tm_mday,
-        timeinfo.tm_hour, timeinfo.tm_min, timeinfo.tm_sec);
+        timeinfo.tm_hour, timeinfo.tm_min, timeinfo.tm_sec,
+        timeinfo.tm_isdst > 0 ? "yes" : "no");
 }
 
 // ─── Sunrise/Sunset Calculation ──────────────────────────────────────────────
@@ -630,6 +649,12 @@ void getSunTimes(int year, int month, int day, double &sunriseMin, double &sunse
     double lat = atof(latitude);
     double lon = atof(longitude);
     int offset = atoi(utcOffset);
+
+    // If DST is currently active (set by configTzTime), adjust the offset
+    struct tm timeinfo;
+    if (getLocalTime(&timeinfo) && timeinfo.tm_isdst > 0) {
+        offset += 1;  // DST: effective offset is 1 hour closer to UTC
+    }
 
     SunSet sun;
     sun.setPosition(lat, lon, offset);
@@ -640,7 +665,7 @@ void getSunTimes(int year, int month, int day, double &sunriseMin, double &sunse
 }
 
 // ─── Check if current time is within active window ───────────────────────────
-// Active window: (sunrise - 60 minutes) to sunset
+// Active window: (sunrise - 60 minutes) to (sunset + 60 minutes)
 bool isWithinActiveWindow() {
     struct tm timeinfo;
     if (!getLocalTime(&timeinfo)) {
@@ -652,8 +677,33 @@ bool isWithinActiveWindow() {
     getSunTimes(timeinfo.tm_year + 1900, timeinfo.tm_mon + 1, timeinfo.tm_mday,
                 sunriseMin, sunsetMin);
 
+    // Validate sunrise/sunset values — the SunSet library can return
+    // negative values or values > 1440 for extreme latitudes or when
+    // the UTC offset doesn't match DST.  Clamp to sane bounds.
+    if (sunriseMin < 0 || sunriseMin > 1440 || sunsetMin < 0 || sunsetMin > 1440) {
+        Serial.printf("[Schedule] WARNING: Invalid sun times (sunrise=%.1f, sunset=%.1f) — defaulting to active\n",
+            sunriseMin, sunsetMin);
+        return true;
+    }
+
+    // Sanity check: sunrise must come before sunset
+    if (sunriseMin >= sunsetMin) {
+        Serial.printf("[Schedule] WARNING: sunrise (%.1f) >= sunset (%.1f) — defaulting to active\n",
+            sunriseMin, sunsetMin);
+        return true;
+    }
+
     double activeStart = sunriseMin - 60.0; // 1 hour before sunrise
-    double activeEnd   = sunsetMin + 60; // 1 hour after sunset
+    double activeEnd   = sunsetMin + 60.0;  // 1 hour after sunset
+
+    // Clamp activeStart to midnight — don't wrap into the previous day
+    if (activeStart < 0.0) {
+        activeStart = 0.0;
+    }
+    // Clamp activeEnd to end of day
+    if (activeEnd > 1440.0) {
+        activeEnd = 1440.0;
+    }
 
     double nowMin = timeinfo.tm_hour * 60.0 + timeinfo.tm_min + timeinfo.tm_sec / 60.0;
 
