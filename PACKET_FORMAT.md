@@ -110,16 +110,27 @@ while True:
 
 ## Packet Rate and Bandwidth
 
-At default settings (48kHz, 64kbps, 60ms frames, 4 frames/packet):
+At default settings (48kHz, 64kbps, 60ms frames, 4 frames/packet, 1s burst interval):
 
 | Metric | Value |
 |--------|-------|
 | Opus frames per second | ~16.7 |
 | UDP packets per second | ~4.2 |
+| Burst interval | 1000 ms |
+| Packets per burst | ~4 |
+| WiFi active time per burst | ~5–10 ms |
+| WiFi duty cycle | ~0.5–1% |
 | Avg encoded frame size | ~480 bytes |
 | Avg UDP packet payload | ~1924 bytes |
 | Total bandwidth (with headers) | ~8.2 kB/s |
 | Compression ratio vs raw PCM | ~11.7x |
+| Added latency from buffering | ~1 second |
+
+### Burst Transmission
+
+Rather than sending each packet immediately as it's assembled, packets are queued in a ring buffer and transmitted in a burst every `BURST_INTERVAL_MS` (default 1000ms). This lets the WiFi radio stay in power-save mode between bursts, significantly reducing power consumption and radio contention.
+
+The trade-off is ~1 second of added latency. For a bird monitoring application this is negligible.
 
 ## Sequence Number Usage
 

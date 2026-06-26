@@ -34,6 +34,11 @@
 #define OPUS_COMPLEXITY_LEVEL 5     // 0-10, higher = better quality but more CPU
 #define OPUS_FRAMES_PER_PACKET 4    // Bundle 4 frames per UDP packet (240ms per packet)
 
+// ─── Burst Transmission Configuration ────────────────────────────────────────
+// Buffer encoded packets and send them in bursts to let WiFi radio sleep between
+#define BURST_INTERVAL_MS     1000  // Accumulate for 1 second, then burst-send
+#define BURST_MAX_PACKETS     8     // Max packets to buffer (8 × 240ms = 1.92s headroom)
+
 // ─── Location defaults (used for sunrise/sunset calculation) ─────────────────
 #define DEFAULT_LATITUDE   "45.4215"
 #define DEFAULT_LONGITUDE  "-75.6972"
@@ -80,6 +85,16 @@ uint8_t udpSequenceNumber = 0;       // wrapping sequence counter for packet ord
 #define UDP_PACKET_HEADER_SIZE 4     // magic(2) + frame_count(1) + seq(1)
 #define UDP_PACKET_BUF_SIZE 1400     // stay well under MTU (1500 - 20 IP - 8 UDP = 1472)
 
+// ─── Burst Buffer (ring of completed packets awaiting transmission) ──────────
+struct BurstPacket {
+    uint8_t data[UDP_PACKET_BUF_SIZE];
+    int length;
+};
+BurstPacket *burstBuffer = nullptr;  // ring buffer in PSRAM
+volatile int burstWriteIdx = 0;      // next slot to write
+volatile int burstReadIdx = 0;       // next slot to send
+unsigned long lastBurstTime = 0;     // timestamp of last burst send
+
 // ─── mDNS Hostname ───────────────────────────────────────────────────────────
 #define MDNS_HOSTNAME     "esp32-birdnet"
 #define MDNS_SERVICE      "birdnet"
@@ -91,6 +106,7 @@ void i2sInit();
 void opusInit();
 void udpInit();
 void flushUdpPacket(uint16_t port);
+void burstSendPackets();
 void httpInit();
 void mdnsInit();
 void startStreaming();
@@ -398,8 +414,10 @@ void opusInit() {
     // Output and packet buffers in internal RAM for fast random access during encoding/framing
     opusOutputBuffer = (uint8_t*)malloc(OPUS_MAX_FRAME_SIZE);
     udpPacketBuffer = (uint8_t*)malloc(UDP_PACKET_BUF_SIZE);
+    // Burst buffer in PSRAM — holds completed packets until burst send
+    burstBuffer = (BurstPacket*)ps_malloc(sizeof(BurstPacket) * BURST_MAX_PACKETS);
 
-    if (!opusInputBuffer || !opusOutputBuffer || !udpPacketBuffer) {
+    if (!opusInputBuffer || !opusOutputBuffer || !udpPacketBuffer || !burstBuffer) {
         Serial.println("[Opus] ERROR: Failed to allocate buffers!");
         return;
     }
@@ -408,6 +426,9 @@ void opusInit() {
     udpPacketOffset = UDP_PACKET_HEADER_SIZE;  // reserve header space
     udpPacketFrameCount = 0;
     udpSequenceNumber = 0;
+    burstWriteIdx = 0;
+    burstReadIdx = 0;
+    lastBurstTime = millis();
 
     int error;
     opusEncoder = opus_encoder_create(sampleRate, 1, OPUS_APPLICATION_AUDIO, &error);
@@ -424,8 +445,9 @@ void opusInit() {
 
     Serial.printf("[Opus] Encoder initialized — %d Hz, %d ms frames (%d samples), %d bps\n",
         sampleRate, OPUS_FRAME_MS, opusFrameSamples, OPUS_BITRATE_BPS);
-    Serial.printf("[Opus] Bundling %d frames/packet (%d ms per UDP packet)\n",
-        OPUS_FRAMES_PER_PACKET, OPUS_FRAME_MS * OPUS_FRAMES_PER_PACKET);
+    Serial.printf("[Opus] Bundling %d frames/packet, burst every %d ms (%d ms buffered)\n",
+        OPUS_FRAMES_PER_PACKET, BURST_INTERVAL_MS,
+        OPUS_FRAME_MS * OPUS_FRAMES_PER_PACKET * BURST_MAX_PACKETS);
 }
 
 // ─── OTA Setup ───────────────────────────────────────────────────────────────
@@ -774,7 +796,7 @@ void streamAudio() {
     }
 }
 
-// Send the assembled multi-frame packet over UDP
+// Queue the assembled multi-frame packet into the burst buffer
 void flushUdpPacket(uint16_t port) {
     if (udpPacketFrameCount == 0) return;
 
@@ -784,35 +806,62 @@ void flushUdpPacket(uint16_t port) {
     udpPacketBuffer[2] = (uint8_t)udpPacketFrameCount;
     udpPacketBuffer[3] = udpSequenceNumber++;
 
-    if (!udp.beginPacket(resolvedUdpAddr, port)) {
-        delay(1);
-        udpPacketOffset = UDP_PACKET_HEADER_SIZE;
-        udpPacketFrameCount = 0;
-        return;
+    // Queue into burst ring buffer
+    int nextWrite = (burstWriteIdx + 1) % BURST_MAX_PACKETS;
+    if (nextWrite == burstReadIdx) {
+        // Buffer full — force an immediate burst to drain
+        burstSendPackets();
     }
-    udp.write(udpPacketBuffer, udpPacketOffset);
-    int sent = udp.endPacket();
 
-    if (sent) {
-        if (!udpFirstPacketLogged) {
-            Serial.printf("[UDP] First packet sent (%d bytes, %d frames, %d ms to %s:%d)\n",
-                udpPacketOffset, udpPacketFrameCount,
-                OPUS_FRAME_MS * udpPacketFrameCount,
-                resolvedUdpAddr.toString().c_str(), port);
-            udpFirstPacketLogged = true;
-        }
-    } else {
-        udpSendErrors++;
-        if (udpSendErrors == 1 || udpSendErrors == 100 || udpSendErrors == 1000 ||
-            udpSendErrors % 10000 == 0) {
-            Serial.printf("[UDP] Send failed (total errors: %lu)\n", udpSendErrors);
-        }
-        delay(2);
-    }
+    memcpy(burstBuffer[burstWriteIdx].data, udpPacketBuffer, udpPacketOffset);
+    burstBuffer[burstWriteIdx].length = udpPacketOffset;
+    burstWriteIdx = (burstWriteIdx + 1) % BURST_MAX_PACKETS;
 
     // Reset for next packet
     udpPacketOffset = UDP_PACKET_HEADER_SIZE;
     udpPacketFrameCount = 0;
+}
+
+// Burst-send all queued packets at once — minimizes WiFi radio active time
+void burstSendPackets() {
+    if (burstReadIdx == burstWriteIdx) return;  // nothing queued
+
+    if (resolvedUdpAddr == IPAddress(0, 0, 0, 0)) return;
+
+    uint16_t port = (uint16_t)atoi(udpPort);
+    int packetsSent = 0;
+
+    while (burstReadIdx != burstWriteIdx) {
+        BurstPacket &pkt = burstBuffer[burstReadIdx];
+
+        if (!udp.beginPacket(resolvedUdpAddr, port)) {
+            delay(1);
+            break;  // Socket not ready — try again next burst
+        }
+        udp.write(pkt.data, pkt.length);
+        int sent = udp.endPacket();
+
+        if (sent) {
+            packetsSent++;
+            if (!udpFirstPacketLogged) {
+                Serial.printf("[UDP] First burst sent (%d bytes to %s:%d)\n",
+                    pkt.length, resolvedUdpAddr.toString().c_str(), port);
+                udpFirstPacketLogged = true;
+            }
+        } else {
+            udpSendErrors++;
+            if (udpSendErrors == 1 || udpSendErrors == 100 || udpSendErrors == 1000 ||
+                udpSendErrors % 10000 == 0) {
+                Serial.printf("[UDP] Send failed (total errors: %lu)\n", udpSendErrors);
+            }
+            break;  // Back off on failure
+        }
+
+        burstReadIdx = (burstReadIdx + 1) % BURST_MAX_PACKETS;
+        yield();  // Let lwIP process between packets in the burst
+    }
+
+    lastBurstTime = millis();
 }
 
 // ─── Main ────────────────────────────────────────────────────────────────────
@@ -826,6 +875,11 @@ void audioTask(void *param) {
     Serial.println("[Audio] Task started on core " + String(xPortGetCoreID()));
     for (;;) {
         streamAudio();
+
+        // Check if it's time to burst-send queued packets
+        if (millis() - lastBurstTime >= BURST_INTERVAL_MS) {
+            burstSendPackets();
+        }
     }
 }
 
