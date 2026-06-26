@@ -10,7 +10,7 @@ packages = [{include = "birdnet_listener", from = "src"}]
 python = "^3.10"
 fastapi = "^0.115.0"
 uvicorn = {version = "^0.30.0", extras = ["standard"]}
-zeroconf = "^0.135.0"
+zeroconf = ">=0.135,<0.150"
 httpx = "^0.28.0"
 numpy = "^2.0.0"
 scipy = "^1.14.0"
