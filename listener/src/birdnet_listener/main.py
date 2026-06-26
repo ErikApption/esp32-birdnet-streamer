@@ -92,12 +92,41 @@ def discover_esp32(timeout: float = 10.0) -> str | None:
 # ─── Push our IP to the ESP32 config API ──────────────────────────────────────
 
 def get_local_ip() -> str:
-    """Get the local IP address that can reach the network."""
+    """
+    Get the IP address to advertise to the ESP32.
+
+    Priority:
+      1. BIRDNET_HOST_IP env var (explicit host IP, useful in Docker bridge mode)
+      2. BIRDNET_LISTENER_IP env var (legacy, same purpose)
+      3. Auto-detect via UDP socket trick
+
+    In Docker bridge networking, auto-detect returns the container IP (172.x.x.x)
+    which is unreachable from the ESP32. Use BIRDNET_HOST_IP to pass the real host IP.
+    """
+    # Check explicit env vars first
+    host_ip = os.environ.get("BIRDNET_HOST_IP")
+    if host_ip:
+        logger.info(f"[IP] Using BIRDNET_HOST_IP={host_ip}")
+        return host_ip
+
+    listener_ip = os.environ.get("BIRDNET_LISTENER_IP")
+    if listener_ip:
+        logger.info(f"[IP] Using BIRDNET_LISTENER_IP={listener_ip}")
+        return listener_ip
+
+    # Auto-detect
     s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
     try:
         # Doesn't actually send anything — just determines the local interface
         s.connect(("8.8.8.8", 80))
-        return s.getsockname()[0]
+        ip = s.getsockname()[0]
+        # Warn if it looks like a Docker bridge IP
+        if ip.startswith("172.") or ip.startswith("10."):
+            logger.warning(
+                f"[IP] Auto-detected IP is {ip} — this looks like a container/internal IP. "
+                f"Set BIRDNET_HOST_IP to the host's real LAN IP if running in Docker bridge mode."
+            )
+        return ip
     except Exception:
         return "127.0.0.1"
     finally:
@@ -486,7 +515,7 @@ def create_app(
 def main():
     parser = argparse.ArgumentParser(description="BirdNet Listener - UDP to HTTP audio bridge")
     parser.add_argument("--udp-port", type=int, default=4000, help="UDP port to listen on (default: 4000)")
-    parser.add_argument("--http-port", type=int, default=8080, help="HTTP port to serve on (default: 8080)")
+    parser.add_argument("--http-port", type=int, default=8086, help="HTTP port to serve on (default: 8086)")
     parser.add_argument("--sample-rate", type=int, default=48000, help="Audio sample rate in Hz (default: 48000)")
     parser.add_argument("--esp32-ip", type=str, default=None, help="ESP32 IP (skips mDNS discovery)")
     parser.add_argument("--listener-ip", type=str, default=None, help="Override local IP sent to ESP32")
@@ -516,7 +545,8 @@ def main():
     if not args.skip_discovery:
         import time
 
-        listener_ip = os.environ.get("BIRDNET_LISTENER_IP") or args.listener_ip or get_local_ip()
+        # get_local_ip() checks BIRDNET_HOST_IP and BIRDNET_LISTENER_IP internally
+        listener_ip = args.listener_ip or get_local_ip()
 
         while True:
             # Discover ESP32 if we don't have an IP yet

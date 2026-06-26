@@ -4,3 +4,4 @@
 .vscode/launch.json
 .vscode/ipch
 listener/src/birdnet_listener/__pycache__
+listener/.env

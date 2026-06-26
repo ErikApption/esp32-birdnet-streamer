@@ -1,0 +1,23 @@
+# docker-compose.yml — BirdNet Listener
+#
+# Configuration is read from the .env file in this directory.
+# Copy .env.example or edit .env directly to set your IPs.
+#
+# Two networking modes:
+#   1. Host networking (recommended) — mDNS works, no IP config needed.
+#   2. Bridge networking — requires BIRDNET_HOST_IP and BIRDNET_ESP32_IP in .env
+#
+# Usage:
+#   docker compose --profile host up        (host networking)
+#   docker compose --profile bridge up      (bridge networking)
+
+services:
+  # ─── Option 1: Host networking (mDNS works out of the box) ──────────────────
+  listener-host:
+    build: .
+    image: birdnet-listener
+    network_mode: host
+    restart: unless-stopped
+    profiles: ["host"]
+    environment:
+      - BIRDNET_ESP32_IP=${BIRDNET_ESP32_IP:-}
