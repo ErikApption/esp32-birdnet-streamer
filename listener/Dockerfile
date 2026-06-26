@@ -15,10 +15,11 @@ ENV POETRY_NO_INTERACTION=1 \
     POETRY_HOME='/usr/local' \
     POETRY_VERSION=1.8.4
 
-# Install system dependencies required by opuslib-next, scipy, and mDNS
+# Install system dependencies required by opuslib-next, scipy, mDNS, and PyOgg
 RUN apt-get update && \
     apt-get install -y --no-install-recommends \
         libopus0 \
+        libogg0 \
         libffi-dev \
         avahi-daemon \
         avahi-utils \

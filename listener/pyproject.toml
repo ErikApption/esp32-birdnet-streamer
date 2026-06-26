@@ -15,6 +15,7 @@ httpx = "^0.28.0"
 numpy = "^2.0.0"
 scipy = "^1.14.0"
 opuslib-next = ">=1.0"
+PyOgg = "^0.6"
 
 [tool.poetry.scripts]
 birdnet-listener = "birdnet_listener.main:main"
