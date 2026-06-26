@@ -653,7 +653,7 @@ bool isWithinActiveWindow() {
                 sunriseMin, sunsetMin);
 
     double activeStart = sunriseMin - 60.0; // 1 hour before sunrise
-    double activeEnd   = sunsetMin;
+    double activeEnd   = sunsetMin + 60; // 1 hour after sunset
 
     double nowMin = timeinfo.tm_hour * 60.0 + timeinfo.tm_min + timeinfo.tm_sec / 60.0;
 
@@ -874,7 +874,9 @@ void burstSendPackets() {
 
 // ─── Main ────────────────────────────────────────────────────────────────────
 #define SCHEDULE_CHECK_INTERVAL_MS  (5 * 60 * 1000)
+#define MDNS_ANNOUNCE_INTERVAL_MS   (120 * 1000)  // Re-advertise mDNS every 2 minutes
 unsigned long lastScheduleCheck = 0;
+unsigned long lastMdnsAnnounce = 0;
 bool streamingStarted = false;
 TaskHandle_t audioTaskHandle = nullptr;
 
@@ -953,6 +955,7 @@ void setup() {
     otaInit();
     mdnsInit();
     httpInit();
+    lastMdnsAnnounce = millis();
 
     if (configured) {
         // Device was previously configured — go straight to streaming
@@ -974,6 +977,14 @@ void loop() {
     // If we just got configured, transition to streaming
     if (configured && !streamingStarted) {
         startStreaming();
+    }
+
+    // Periodically re-advertise mDNS so restarted listeners can discover us
+    if (millis() - lastMdnsAnnounce >= MDNS_ANNOUNCE_INTERVAL_MS) {
+        lastMdnsAnnounce = millis();
+        // Query our own hostname — this triggers mDNS traffic that keeps
+        // our records fresh in the caches of other machines on the LAN
+        MDNS.queryHost(MDNS_HOSTNAME, 1000);
     }
 
     // Periodically check if we've passed sunset
