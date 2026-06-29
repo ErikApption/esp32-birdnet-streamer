@@ -35,14 +35,25 @@ class StreamBuffer:
         for event in self._subscribers:
             event.set()
 
-    async def stream_from(self) -> AsyncGenerator[bytes, None]:
-        """Yield data chunks as they arrive. Each caller gets its own wakeup event."""
+    async def stream_from(self, timeout: float = 30.0) -> AsyncGenerator[bytes, None]:
+        """
+        Yield data chunks as they arrive. Each caller gets its own wakeup event.
+
+        Args:
+            timeout: Max seconds to wait for new data before assuming the stream
+                     is dead. Prevents zombie subscribers from accumulating.
+        """
         event = asyncio.Event()
         self._subscribers.append(event)
         last_seq = self._seq
         try:
             while True:
-                await event.wait()
+                try:
+                    await asyncio.wait_for(event.wait(), timeout=timeout)
+                except asyncio.TimeoutError:
+                    # No data arrived within the timeout — stop streaming
+                    logger.debug("[StreamBuffer] Subscriber timed out waiting for data, closing")
+                    return
                 event.clear()
 
                 new_chunks = self._seq - last_seq
@@ -53,7 +64,10 @@ class StreamBuffer:
                         yield chunk
                     last_seq = self._seq
         finally:
-            self._subscribers.remove(event)
+            try:
+                self._subscribers.remove(event)
+            except ValueError:
+                pass  # Already removed (shouldn't happen, but be safe)
 
 
 class UDPReceiverProtocol(asyncio.DatagramProtocol):

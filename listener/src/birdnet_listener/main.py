@@ -108,6 +108,7 @@ def create_app(
             "buffer_chunks": len(audio_buffer._buffer),
             "buffer_seq": audio_buffer._seq,
             "active_subscribers": len(audio_buffer._subscribers),
+            "active_opus_subscribers": len(opus_buffer._subscribers),
             "endpoints": {
                 "playlist": "/stream.m3u",
                 "stream": "/stream",
@@ -130,13 +131,15 @@ def create_app(
         )
 
     @app.get("/stream")
-    async def stream():
+    async def stream(request: Request):
         """Stream live audio as WAV (PCM 16-bit)."""
         wav_header = make_wav_header(sample_rate, channels=channels)
 
         async def audio_generator() -> AsyncGenerator[bytes, None]:
             yield wav_header
             async for chunk in audio_buffer.stream_from():
+                if await request.is_disconnected():
+                    break
                 processed = chunk
                 if noise_reducer is not None:
                     processed = noise_reducer.reduce(processed)
@@ -157,7 +160,7 @@ def create_app(
         )
 
     @app.get("/stream.opus")
-    async def stream_opus():
+    async def stream_opus(request: Request):
         """Stream live audio as Ogg/Opus (passthrough, no decoding/re-encoding)."""
 
         async def opus_generator() -> AsyncGenerator[bytes, None]:
@@ -166,6 +169,11 @@ def create_app(
 
             try:
                 async for opus_frame in opus_buffer.stream_from():
+                    # Check if client has disconnected
+                    if await request.is_disconnected():
+                        logger.debug("[Opus] Client disconnected, closing stream")
+                        break
+
                     page_data = ogg_stream.write_opus_frame(opus_frame)
                     if page_data:
                         yield page_data

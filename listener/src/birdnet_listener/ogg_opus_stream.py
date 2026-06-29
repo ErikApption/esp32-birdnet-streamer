@@ -86,15 +86,17 @@ class OggOpusStream:
 
         return bytes(output)
 
-    def write_opus_frame(self, opus_frame: bytes) -> bytes:
+    def write_opus_frame(self, opus_frame: bytes, flush: bool = True) -> bytes:
         """
         Wrap a single pre-encoded Opus frame into Ogg page(s).
 
         Args:
             opus_frame: Raw Opus-encoded frame bytes.
+            flush: If True, force-flush after each frame for low-latency streaming.
+                   If False, let libogg decide when to emit pages (higher latency).
 
         Returns:
-            Ogg page bytes (may be empty if libogg is buffering the page).
+            Ogg page bytes (may be empty if not flushing and libogg is buffering).
         """
         self._granule_pos += self.frame_duration_samples
         self._write_packet_data(
@@ -103,6 +105,8 @@ class OggOpusStream:
             bos=False,
             eos=False,
         )
+        if flush:
+            return self._flush_pages()
         return self._get_pages()
 
     def close(self) -> bytes:
