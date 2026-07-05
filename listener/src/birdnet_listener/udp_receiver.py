@@ -77,13 +77,25 @@ class UDPReceiverProtocol(asyncio.DatagramProtocol):
     Raw Opus frames are always pushed to the opus_buffer (cheap passthrough).
     Opus-to-PCM decoding only occurs when the audio_buffer has active subscribers
     (i.e., someone is connected to the WAV stream), saving CPU otherwise.
+
+    Also handles telemetry packets (magic "TL") containing battery/solar voltage.
     """
 
     LOG_INTERVAL = 5.0  # seconds between status logs
     PACKET_MAGIC = b"OP"
+    TELEMETRY_MAGIC = b"TL"
     HEADER_SIZE = 4  # 2 bytes magic + 1 byte frame_count + 1 byte sequence_number
+    TELEMETRY_SIZE = 6  # 2 magic + 2 bat_adc_mV + 2 sol_adc_mV
     FRAME_SIZE = 2880  # 60ms at 48kHz mono (samples per frame)
     LARGE_GAP_THRESHOLD = 128  # gaps larger than this are treated as reordering
+
+    # Voltage divider ratios (applied to raw ADC values to recover real voltage)
+    VBAT_DIVIDER_RATIO = 2.0   # R1=R2=100kΩ → Vreal = Vadc × 2
+    VSOL_DIVIDER_RATIO = 3.2   # R3=220kΩ, R4=100kΩ → Vreal = Vadc × 3.2
+
+    # Battery SoC estimation (3S NiMH linear approximation)
+    VBAT_EMPTY = 3.0  # Volts
+    VBAT_FULL  = 4.2  # Volts
 
     def __init__(
         self,
@@ -111,6 +123,12 @@ class UDPReceiverProtocol(asyncio.DatagramProtocol):
         # Decoder is created lazily when first needed
         self._opus_decoder: opuslib.Decoder | None = None
         self._decoder_needs_reset = False
+
+        # Telemetry state (updated from "TL" packets)
+        self.battery_voltage: float = 0.0
+        self.solar_voltage: float = 0.0
+        self.battery_percent: int = 0
+        self._telemetry_received: int = 0
 
     def _get_decoder(self) -> opuslib.Decoder:
         """Get or create the Opus decoder, resetting if needed after packet loss."""
@@ -165,6 +183,30 @@ class UDPReceiverProtocol(asyncio.DatagramProtocol):
             self._invalid_packets += 1
             if self._invalid_packets <= 3:
                 logger.warning(f"[UDP] Packet too short ({len(data)} bytes), need at least {self.HEADER_SIZE}")
+            return
+
+        # ─── Handle telemetry packets ────────────────────────────────────
+        if data[0:2] == self.TELEMETRY_MAGIC:
+            if len(data) >= self.TELEMETRY_SIZE:
+                # Raw ADC millivolts from ESP32
+                bat_adc_mv = int.from_bytes(data[2:4], "big")
+                sol_adc_mv = int.from_bytes(data[4:6], "big")
+
+                # Apply divider ratios to recover actual voltages
+                self.battery_voltage = (bat_adc_mv / 1000.0) * self.VBAT_DIVIDER_RATIO
+                self.solar_voltage = (sol_adc_mv / 1000.0) * self.VSOL_DIVIDER_RATIO
+
+                # Estimate battery SoC (linear for 3S NiMH)
+                pct = (self.battery_voltage - self.VBAT_EMPTY) / (self.VBAT_FULL - self.VBAT_EMPTY) * 100.0
+                self.battery_percent = int(max(0, min(100, pct)))
+
+                self._telemetry_received += 1
+                if self._telemetry_received <= 3 or self._telemetry_received % 60 == 0:
+                    logger.info(
+                        f"[Telemetry] Battery: {self.battery_voltage:.2f}V ({self.battery_percent}%), "
+                        f"Solar: {self.solar_voltage:.2f}V "
+                        f"(raw ADC: bat={bat_adc_mv}mV, sol={sol_adc_mv}mV)"
+                    )
             return
 
         if data[0:2] != self.PACKET_MAGIC:

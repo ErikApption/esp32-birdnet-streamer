@@ -21,7 +21,7 @@ Most I2S MEMS microphones (INMP441, SPH0645, ICS-43434) have 6 pins. Connect the
 
 | Mic Pin | Function       | Wire   | ESP32-S3 GPIO | Notes                                                                       |
 | ------- | -------------- | ------ | ------------- | --------------------------------------------------------------------------- |
-| VDD     | Power          | Brown  | 3.3V          | Do NOT use 5V — MEMS mics are 3.3V devices                                  |
+| VDD     | Power          | Brown  | GPIO 10       | Powered from a GPIO pin (~1.4 mA). Do NOT use 5V — MEMS mics are 3.3V.     |
 | GND     | Ground         | Black  | GND           |                                                                             |
 | SCK     | Bit Clock      | Orange | GPIO 4        | Serial clock driven by ESP32                                                |
 | WS      | Word Select    | Yellow | GPIO 5        | Frame/channel sync signal                                                   |
@@ -33,7 +33,7 @@ Most I2S MEMS microphones (INMP441, SPH0645, ICS-43434) have 6 pins. Connect the
 ```
 ESP32-S3 DevKitC              I2S MEMS Mic
 ─────────────────             ────────────
-3.3V  ────────────────────────  VDD
+GPIO 10 ──────────────────────  VDD  ← powered from GPIO
 GND   ────────────────────────  GND
 GPIO 4 ───────────────────────  SCK
 GPIO 5 ───────────────────────  WS
@@ -48,6 +48,36 @@ GND   ────────────────────────  
 - If you hear silence, double-check that L/R (SEL) is tied to GND (left) — the firmware reads the left channel only.
 - To use the right channel instead, change `I2S_CHANNEL_FMT_ONLY_LEFT` to `I2S_CHANNEL_FMT_ONLY_RIGHT` in `main.cpp` and tie L/R to 3.3V.
 - The pin assignments can be changed by editing the `I2S_WS_PIN`, `I2S_SD_PIN`, and `I2S_SCK_PIN` defines at the top of `main.cpp`.
+
+### Complete GPIO Pin Assignment Table
+
+All ESP32-S3 GPIOs used in this project, including the I2S microphone and the battery/solar power monitoring circuit.
+
+| GPIO | Function          | Direction  | Subsystem        | Notes                                                        |
+|------|-------------------|------------|------------------|--------------------------------------------------------------|
+| 4    | I2S_SCK (BCLK)   | OUTPUT     | I2S Microphone   | Bit clock to INMP441                                         |
+| 5    | I2S_WS (LRCLK)   | OUTPUT     | I2S Microphone   | Word select / frame sync                                     |
+| 6    | I2S_SD (DOUT)     | INPUT      | I2S Microphone   | Serial audio data from mic                                   |
+| 7    | MONITOR_EN        | OUTPUT     | Power Monitor    | MOSFET gate — enables voltage dividers (10kΩ pull-down)      |
+| 8    | VBAT_SENSE        | ADC INPUT  | Power Monitor    | Battery voltage via divider (ADC1_CH7, 11dB atten)           |
+| 9    | VSOL_SENSE        | ADC INPUT  | Power Monitor    | Solar panel voltage via divider (ADC1_CH8, 11dB atten)       |
+| 10   | MIC_POWER         | OUTPUT     | I2S Microphone   | Powers INMP441 VDD (~1.4 mA, software-controlled)            |
+
+
+#### Pin selection rationale
+
+- **GPIOs 4–6** — I2S peripheral pins, grouped sequentially for clean routing.
+- **GPIO 7** — MOSFET gate for the zero-quiescent-current power monitor switch. Held LOW during deep sleep by 10kΩ pull-down resistor; no RTC config needed.
+- **GPIOs 8–9** — ADC1 channels (CH7, CH8). ADC1 remains usable when WiFi is active (ADC2 is not). 11dB attenuation gives 0–3.1V input range.
+- **GPIO 10** — Mic power. Allows software power-cycling of the INMP441 and draws zero current during deep sleep (pin goes Hi-Z).
+- All selected pins are general-purpose on the ESP32-S3-DevKitC-1 (N16R8) with no conflicting boot-strapping or flash functions.
+
+## Power Setup
+
+- Source: 3S NiMh batteries
+- Buck/Boost module for powering the ESP32 from the 3S batteries
+- NiMh charger module for charging the batteries from a USB-C solar panel
+- Power monitoring for solar panel input and battery voltage
 
 ## Build Instructions
 

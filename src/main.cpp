@@ -18,6 +18,9 @@
 #define I2S_SCK_PIN       4   // Serial Clock (BCLK)
 #define I2S_PORT          I2S_NUM_0
 
+// ─── Microphone Power Pin ────────────────────────────────────────────────────
+#define MIC_POWER_PIN     10  // GPIO powering INMP441 VDD (~1.4 mA)
+
 #define DEFAULT_SAMPLE_RATE 48000
 #define SAMPLE_BITS       I2S_BITS_PER_SAMPLE_32BIT
 #define I2S_CHANNEL_FMT   I2S_CHANNEL_FMT_ONLY_LEFT
@@ -47,6 +50,20 @@
 // ─── NTP Configuration ──────────────────────────────────────────────────────
 #define NTP_SERVER        "pool.ntp.org"
 
+// ─── Power Monitor Configuration ─────────────────────────────────────────────
+#define MONITOR_EN_PIN    7   // GPIO to enable voltage dividers (MOSFET gate)
+#define VBAT_ADC_PIN      8   // ADC1_CH7 — battery voltage
+#define VSOL_ADC_PIN      9   // ADC1_CH8 — solar voltage
+#define ADC_VREF          3.1f
+#define ADC_RESOLUTION    4095.0f
+#define ADC_SAMPLES       16
+#define POWER_READ_INTERVAL_MS  (60 * 1000)  // Read every 60 seconds
+
+// Telemetry packet: magic "TL" + battery_adc_mV (uint16) + solar_adc_mV (uint16)
+#define TELEMETRY_MAGIC_0   0x54  // 'T'
+#define TELEMETRY_MAGIC_1   0x4C  // 'L'
+#define TELEMETRY_PACKET_SIZE 6   // 2 magic + 2 bat_adc_mV + 2 sol_adc_mV
+
 // ─── HTTP Config Server ──────────────────────────────────────────────────────
 #define HTTP_PORT         80
 
@@ -61,6 +78,18 @@ char latitude[12]   = DEFAULT_LATITUDE;
 char longitude[12]  = DEFAULT_LONGITUDE;
 char utcOffset[4]   = DEFAULT_UTC_OFFSET;
 bool sleepEnabled   = false;
+
+// ─── Power Monitor State ─────────────────────────────────────────────────────
+float lastBatteryVoltage = 0.0f;  // raw ADC voltage (before divider scaling)
+float lastSolarVoltage   = 0.0f;  // raw ADC voltage (before divider scaling)
+unsigned long lastPowerReadTime = 0;
+
+// ─── UDP Target (used by streaming and telemetry) ────────────────────────────
+IPAddress resolvedUdpAddr;
+unsigned long lastResolveTime = 0;
+unsigned long udpSendErrors = 0;
+bool udpFirstPacketLogged = false;
+
 uint32_t sampleRate = DEFAULT_SAMPLE_RATE;
 char sampleRateStr[8] = "48000";
 bool configured     = false;  // true once a config has been received (persisted in NVS)
@@ -119,6 +148,9 @@ void syncTime();
 void loadSettings();
 void saveSettings();
 void getSunTimes(int year, int month, int day, double &sunriseMin, double &sunsetMin);
+void powerMonitorInit();
+void readPowerMonitor();
+void sendTelemetryPacket();
 
 // ─── Persistent Settings (NVS) ───────────────────────────────────────────────
 void loadSettings() {
@@ -294,10 +326,33 @@ void handleNotFound() {
     server.send(404, "text/plain", "Not found");
 }
 
+void handlePostSleep() {
+    if (!server.hasArg("minutes")) {
+        server.send(400, "application/json", "{\"error\":\"missing 'minutes' parameter\"}");
+        return;
+    }
+
+    int minutes = server.arg("minutes").toInt();
+    if (minutes <= 0 || minutes > 1440) {
+        server.send(400, "application/json", "{\"error\":\"'minutes' must be between 1 and 1440\"}");
+        return;
+    }
+
+    String json = "{\"status\":\"sleeping\",\"minutes\":" + String(minutes) + "}";
+    server.send(200, "application/json", json);
+    Serial.printf("[HTTP] Sleep requested for %d minutes\n", minutes);
+
+    // Give the HTTP response time to be sent before sleeping
+    delay(100);
+
+    enterDeepSleep((uint64_t)minutes * 60);
+}
+
 void httpInit() {
     server.on("/config", HTTP_GET, handleGetConfig);
     server.on("/config", HTTP_POST, handlePostConfig);
     server.on("/status", HTTP_GET, handleGetStatus);
+    server.on("/sleep", HTTP_POST, handlePostSleep);
     server.onNotFound(handleNotFound);
     server.begin();
     Serial.printf("[HTTP] Config server on port %d\n", HTTP_PORT);
@@ -369,8 +424,72 @@ IPAddress resolveHost(const char* hostname) {
     return IPAddress(0, 0, 0, 0);
 }
 
+// ─── Power Monitor ───────────────────────────────────────────────────────────
+void powerMonitorInit() {
+    pinMode(MONITOR_EN_PIN, OUTPUT);
+    digitalWrite(MONITOR_EN_PIN, LOW);  // Dividers OFF by default
+    analogSetAttenuation(ADC_11db);     // 0–3.1V range
+    analogReadResolution(12);           // 12-bit (0–4095)
+    Serial.println("[Power] Monitor initialized");
+}
+
+float readAdcVoltage(int pin) {
+    uint32_t sum = 0;
+    for (int i = 0; i < ADC_SAMPLES; i++) {
+        sum += analogRead(pin);
+        delayMicroseconds(100);
+    }
+    float avgRaw = (float)sum / ADC_SAMPLES;
+    return (avgRaw / ADC_RESOLUTION) * ADC_VREF;
+}
+
+void readPowerMonitor() {
+    // Enable voltage dividers
+    digitalWrite(MONITOR_EN_PIN, HIGH);
+    delay(2);  // RC settling time
+
+    float vBatAdc = readAdcVoltage(VBAT_ADC_PIN);
+    float vSolAdc = readAdcVoltage(VSOL_ADC_PIN);
+
+    // Disable voltage dividers
+    digitalWrite(MONITOR_EN_PIN, LOW);
+
+    // Store raw ADC voltages (divider scaling applied by the receiver)
+    lastBatteryVoltage = vBatAdc;
+    lastSolarVoltage   = vSolAdc;
+
+    Serial.printf("[Power] ADC raw — Battery: %.3fV, Solar: %.3fV\n",
+                  lastBatteryVoltage, lastSolarVoltage);
+}
+
+void sendTelemetryPacket() {
+    if (resolvedUdpAddr == IPAddress(0, 0, 0, 0)) return;
+
+    uint16_t port = (uint16_t)atoi(udpPort);
+    // Send raw ADC millivolts (before divider scaling)
+    uint16_t batMv = (uint16_t)(lastBatteryVoltage * 1000.0f);
+    uint16_t solMv = (uint16_t)(lastSolarVoltage * 1000.0f);
+
+    uint8_t pkt[TELEMETRY_PACKET_SIZE];
+    pkt[0] = TELEMETRY_MAGIC_0;       // 'T'
+    pkt[1] = TELEMETRY_MAGIC_1;       // 'L'
+    pkt[2] = (uint8_t)(batMv >> 8);   // battery ADC mV big-endian
+    pkt[3] = (uint8_t)(batMv & 0xFF);
+    pkt[4] = (uint8_t)(solMv >> 8);   // solar ADC mV big-endian
+    pkt[5] = (uint8_t)(solMv & 0xFF);
+
+    udp.beginPacket(resolvedUdpAddr, port);
+    udp.write(pkt, TELEMETRY_PACKET_SIZE);
+    udp.endPacket();
+}
+
 // ─── I2S Setup ───────────────────────────────────────────────────────────────
 void i2sInit() {
+    // Power up the INMP441 microphone from a GPIO pin
+    pinMode(MIC_POWER_PIN, OUTPUT);
+    digitalWrite(MIC_POWER_PIN, HIGH);
+    delay(100);  // Allow mic to stabilize after power-on
+
     i2s_config_t i2sConfig = {
         .mode = (i2s_mode_t)(I2S_MODE_MASTER | I2S_MODE_RX),
         .sample_rate = sampleRate,
@@ -749,18 +868,16 @@ uint64_t secondsUntilNextActiveWindow() {
 // ─── Deep Sleep ──────────────────────────────────────────────────────────────
 void enterDeepSleep(uint64_t sleepSeconds) {
     Serial.printf("[Sleep] Entering deep sleep for %llu seconds\n", sleepSeconds);
-    Serial.flush();
 
+    // Ensure microphone is powered down before sleeping
+    digitalWrite(MIC_POWER_PIN, LOW);
+
+    Serial.flush();
     esp_sleep_enable_timer_wakeup(sleepSeconds * 1000000ULL);
     esp_deep_sleep_start();
 }
 
 // ─── Audio Streaming ─────────────────────────────────────────────────────────
-// Cached resolved UDP target IP (re-resolved periodically or on config change)
-IPAddress resolvedUdpAddr;
-unsigned long lastResolveTime = 0;
-unsigned long udpSendErrors = 0;
-bool udpFirstPacketLogged = false;
 #define RESOLVE_INTERVAL_MS  (60 * 1000)  // re-resolve every 60s
 
 void udpInit() {
@@ -1005,6 +1122,7 @@ void setup() {
     otaInit();
     mdnsInit();
     httpInit();
+    powerMonitorInit();
     lastMdnsAnnounce = millis();
 
     if (configured) {
@@ -1047,6 +1165,13 @@ void loop() {
                 uint64_t sleepSec = secondsUntilNextActiveWindow();
                 enterDeepSleep(sleepSec);
             }
+        }
+
+        // Periodically read battery/solar voltages and send telemetry
+        if (millis() - lastPowerReadTime >= POWER_READ_INTERVAL_MS) {
+            lastPowerReadTime = millis();
+            readPowerMonitor();
+            sendTelemetryPacket();
         }
     }
 

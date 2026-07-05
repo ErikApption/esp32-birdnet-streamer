@@ -109,6 +109,12 @@ def create_app(
             "buffer_seq": audio_buffer._seq,
             "active_subscribers": len(audio_buffer._subscribers),
             "active_opus_subscribers": len(opus_buffer._subscribers),
+            "power": {
+                "battery_voltage": udp_protocol.battery_voltage if udp_protocol else 0.0,
+                "battery_percent": udp_protocol.battery_percent if udp_protocol else 0,
+                "solar_voltage": udp_protocol.solar_voltage if udp_protocol else 0.0,
+                "telemetry_packets": udp_protocol._telemetry_received if udp_protocol else 0,
+            },
             "endpoints": {
                 "playlist": "/stream.m3u",
                 "stream": "/stream",
