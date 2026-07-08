@@ -88,9 +88,13 @@ unsigned long lastDiagTelemetryTime = 0;
 #define DIAG_TELEMETRY_INTERVAL_MS 2000  // Send telemetry every 2s in diagnostic mode
 
 // ─── I2S Signal Monitor State ────────────────────────────────────────────────
-volatile bool i2sSignalDetected = false;  // set by audio task when samples are non-zero
+volatile uint32_t i2sFramesTotal = 0;   // total DMA frames processed in current window
+volatile uint32_t i2sFramesEmpty = 0;   // DMA frames with no meaningful audio content
+volatile uint32_t opusFramesEncoded = 0; // Opus frames encoded in current window
+volatile uint32_t opusFramesSilent = 0;  // Opus frames that encoded as near-silent (very few bytes)
 unsigned long lastSignalCheckTime = 0;
 #define SIGNAL_CHECK_INTERVAL_MS 500  // LED update interval
+#define OPUS_SILENT_THRESHOLD 10      // Opus frames <= this many bytes are silence/comfort noise
 
 // ─── Power Monitor State ─────────────────────────────────────────────────────
 float lastBatteryVoltage = 0.0f;  // raw ADC voltage (before divider scaling)
@@ -372,8 +376,8 @@ void httpInit() {
     server.on("/config", HTTP_POST, handlePostConfig);
     server.on("/status", HTTP_GET, handleGetStatus);
     server.on("/sleep", HTTP_POST, handlePostSleep);
-    server.on("/diag/start", HTTP_POST, handleDiagStart);
-    server.on("/diag/stop", HTTP_POST, handleDiagStop);
+    server.on("/diag/start", HTTP_GET, handleDiagStart);
+    server.on("/diag/stop", HTTP_GET, handleDiagStop);
     server.onNotFound(handleNotFound);
     server.begin();
     Serial.printf("[HTTP] Config server on port %d\n", HTTP_PORT);
@@ -531,20 +535,63 @@ void handleDiagStop() {
 }
 
 // ─── I2S Signal LED Indicator ────────────────────────────────────────────────
-// Uses the onboard RGB LED (GPIO 48) to show I2S microphone signal status.
+// Uses the onboard RGB LED (GPIO 48) to show audio pipeline health.
 // Only active during diagnostic mode to save power.
-//   - RED:   No signal detected (all zeros / silence)
-//   - GREEN: Signal is being received
+// Error states are latched for a minimum duration so they're visible.
+//   - RED:    Mic off/disconnected (I2S frames empty) or all Opus frames silent
+//   - YELLOW: Intermittent issue — some Opus frames encoding as silence (blank audio)
+//   - GREEN:  Healthy — mic active and Opus encoding real audio content
+#define LED_LATCH_DURATION_MS 3000  // Hold error state for at least 3 seconds
+unsigned long ledLatchUntil = 0;    // millis() timestamp when latch expires
+uint8_t latchedState = 0;           // 0=green, 1=yellow, 2=red
+
 void updateSignalLed() {
     if (!diagnosticMode) return;  // LED stays off outside diagnostic mode
 
-    if (i2sSignalDetected) {
-        neopixelWrite(RGB_BUILTIN, 0, 20, 0);  // Green — signal OK
-    } else {
-        neopixelWrite(RGB_BUILTIN, 20, 0, 0);  // Red — no signal
+    uint32_t total = i2sFramesTotal;
+    uint32_t empty = i2sFramesEmpty;
+    uint32_t opTotal = opusFramesEncoded;
+    uint32_t opSilent = opusFramesSilent;
+
+    // Determine worst status between I2S and Opus levels
+    bool i2sDead = (total == 0 || empty == total);
+    bool i2sIntermittent = (empty > 0 && !i2sDead);
+    bool opusDead = (opTotal > 0 && opSilent == opTotal);
+    bool opusIntermittent = (opTotal > 0 && opSilent > 0 && !opusDead);
+
+    // Determine current state
+    uint8_t currentState = 0;  // green
+    if (i2sDead || opusDead) {
+        currentState = 2;  // red
+    } else if (i2sIntermittent || opusIntermittent) {
+        currentState = 1;  // yellow
     }
-    // Reset the flag; the audio task will set it again if signal is present
-    i2sSignalDetected = false;
+
+    // Latch: only upgrade severity or refresh latch timer, never downgrade while latched
+    if (currentState > latchedState || currentState >= latchedState) {
+        if (currentState > 0) {
+            latchedState = currentState;
+            ledLatchUntil = millis() + LED_LATCH_DURATION_MS;
+        }
+    }
+
+    // If latch has expired, allow return to green
+    if (millis() >= ledLatchUntil) {
+        latchedState = currentState;
+    }
+
+    // Apply LED color based on latched state
+    switch (latchedState) {
+        case 2:  neopixelWrite(RGB_BUILTIN, 20, 0, 0);   break;  // Red
+        case 1:  neopixelWrite(RGB_BUILTIN, 20, 15, 0);  break;  // Yellow
+        default: neopixelWrite(RGB_BUILTIN, 0, 20, 0);   break;  // Green
+    }
+
+    // Reset counters for the next window
+    i2sFramesTotal = 0;
+    i2sFramesEmpty = 0;
+    opusFramesEncoded = 0;
+    opusFramesSilent = 0;
 }
 
 // ─── I2S Setup ───────────────────────────────────────────────────────────────
@@ -593,8 +640,10 @@ void i2sInit() {
 void opusInit() {
     opusFrameSamples = sampleRate * OPUS_FRAME_MS / 1000;
 
-    // Input buffer in PSRAM (large, sequential writes only)
-    opusInputBuffer = (int16_t*)ps_malloc(sizeof(int16_t) * opusFrameSamples);
+    // Input buffer in internal RAM — Opus encoder does random-access reads on this,
+    // and PSRAM can return stale data under cache pressure, causing silent gaps.
+    // At 48kHz/60ms this is only 5760 bytes — fits easily in internal SRAM.
+    opusInputBuffer = (int16_t*)malloc(sizeof(int16_t) * opusFrameSamples);
     // Output and packet buffers in internal RAM for fast random access during encoding/framing
     opusOutputBuffer = (uint8_t*)malloc(OPUS_MAX_FRAME_SIZE);
     udpPacketBuffer = (uint8_t*)malloc(UDP_PACKET_BUF_SIZE);
@@ -723,6 +772,7 @@ void wifiInit() {
         wm.setSaveParamsCallback(saveParamsCallback);
 
         wm.setConfigPortalTimeout(180);
+        wm.setConnectTimeout(20);  // Allow 20 seconds for WiFi connection
 
         bool connected = wm.autoConnect("BirdNet-Setup");
 
@@ -1005,12 +1055,53 @@ void streamAudio() {
         i2sBuffer[i] = (int16_t)(i2sReadBuffer[i] >> 14);
     }
 
-    // Signal detection: check if any samples exceed a noise floor threshold
-    // This drives the onboard LED indicator (red = no signal, green = signal)
+    // Signal detection: classify this frame as active or empty.
+    // Catches multiple failure modes:
+    //   - SD shorted to ground: all zeros or very low amplitude
+    //   - SD partially shorted: small values from crosstalk (below normal mic output)
+    //   - Stuck data line: identical consecutive samples
+    //   - Mic unpowered: raw values below driven threshold
+    
+    i2sFramesTotal++;
+    
+    // Check raw 32-bit amplitude — real mic signal produces large magnitudes
+    int activeCount = 0;
+    const int32_t RAW_SIGNAL_THRESHOLD = 100000;
     for (int i = 0; i < samplesRead32; i++) {
-        if (abs(i2sBuffer[i]) > 16) {  // threshold above ADC noise floor
-            i2sSignalDetected = true;
-            break;
+        int32_t raw = i2sReadBuffer[i];
+        if (raw > RAW_SIGNAL_THRESHOLD || raw < -RAW_SIGNAL_THRESHOLD) {
+            activeCount++;
+        }
+    }
+    
+    if (activeCount <= samplesRead32 / 20) {
+        // Mic not driving bus (unpowered, SD shorted to GND, etc.)
+        i2sFramesEmpty++;
+    } else {
+        // Bus is driven — check quality of the 16-bit audio
+        int16_t minVal = i2sBuffer[0], maxVal = i2sBuffer[0];
+        for (int i = 1; i < samplesRead32; i++) {
+            if (i2sBuffer[i] < minVal) minVal = i2sBuffer[i];
+            if (i2sBuffer[i] > maxVal) maxVal = i2sBuffer[i];
+        }
+        int peakToPeak = (int)maxVal - (int)minVal;
+        
+        // Stuck sample detection (data line fault)
+        int maxStuckRun = 0, currentStuckRun = 1;
+        for (int i = 1; i < samplesRead32; i++) {
+            if (i2sBuffer[i] == i2sBuffer[i - 1]) {
+                currentStuckRun++;
+                if (currentStuckRun > maxStuckRun) maxStuckRun = currentStuckRun;
+            } else {
+                currentStuckRun = 1;
+            }
+        }
+        
+        // A healthy INMP441 produces peak-to-peak > 50 even in silence (self-noise).
+        // Lower than that indicates SD is partially shorted or heavily attenuated.
+        // Stuck runs > 25% indicate the data line is not transitioning properly.
+        if (peakToPeak < 50 || maxStuckRun > samplesRead32 / 4) {
+            i2sFramesEmpty++;
         }
     }
 
@@ -1055,6 +1146,13 @@ void streamAudio() {
             if (encodedBytes <= 0) {
                 // Opus encoding error — skip this frame
                 continue;
+            }
+
+            // Track Opus output size for diagnostic LED — very small frames
+            // indicate the encoder received silence/blank input
+            opusFramesEncoded++;
+            if (encodedBytes <= OPUS_SILENT_THRESHOLD) {
+                opusFramesSilent++;
             }
 
             // Check if this frame fits in the current packet buffer
@@ -1210,6 +1308,10 @@ void startStreaming() {
 void setup() {
     Serial.begin(115200);
     delay(1000);
+
+    // Turn off the onboard RGB LED immediately — it may retain state across resets
+    neopixelWrite(RGB_BUILTIN, 0, 0, 0);
+
     Serial.println("\n══════════════════════════════════════════════════");
     Serial.println("       ESP32 BirdNet Streamer — Booting");
     Serial.println("══════════════════════════════════════════════════");

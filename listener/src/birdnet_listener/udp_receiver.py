@@ -130,6 +130,11 @@ class UDPReceiverProtocol(asyncio.DatagramProtocol):
         self.battery_percent: int = 0
         self._telemetry_received: int = 0
 
+        # Silent/empty frame detection (based on Opus frame size, no decoding needed)
+        self._silence_frames: int = 0
+        self._total_frames: int = 0
+        self._silence_warned: bool = False
+
     def _get_decoder(self) -> opuslib.Decoder:
         """Get or create the Opus decoder, resetting if needed after packet loss."""
         if self._opus_decoder is None or self._decoder_needs_reset:
@@ -160,6 +165,14 @@ class UDPReceiverProtocol(asyncio.DatagramProtocol):
             if not self.audio_buffer.has_subscribers:
                 msg += " (decoding skipped, no WAV clients)"
             logger.info(msg)
+
+            # Warn about silent/empty frames (possible mic wiring issue)
+            if self._silence_frames > 0 and self._total_frames > 0:
+                pct = self._silence_frames / self._total_frames * 100
+                logger.warning(
+                    f"[Audio] Silent frames: {self._silence_frames}/{self._total_frames} "
+                    f"({pct:.1f}%) — possible mic wiring issue (data line shorted or disconnected)"
+                )
         else:
             if self._receiving:
                 logger.info("[UDP] Stream stopped — no packets received")
@@ -256,6 +269,15 @@ class UDPReceiverProtocol(asyncio.DatagramProtocol):
 
             opus_frame = payload[offset:offset + frame_len]
             offset += frame_len
+
+            # Detect silent/empty Opus frames without decoding.
+            # Opus encodes silence into very small frames (typically <= 3 bytes with DTX,
+            # or a characteristic small size even without DTX). A healthy 60ms frame at
+            # 64kbps should be ~480 bytes. Frames under 10 bytes almost certainly contain
+            # no real audio content — indicates mic wiring fault or data line issue.
+            self._total_frames += 1
+            if frame_len <= 3:
+                self._silence_frames += 1
 
             # Always push raw Opus frames (cheap, just bytes)
             if self.opus_buffer is not None:
