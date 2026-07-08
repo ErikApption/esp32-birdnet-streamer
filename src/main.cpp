@@ -836,6 +836,7 @@ bool isWithinActiveWindow() {
 uint64_t secondsUntilNextActiveWindow() {
     struct tm timeinfo;
     if (!getLocalTime(&timeinfo)) {
+        Serial.println("[Schedule] Cannot get time — fallback 1 hour sleep");
         return 3600; // Fallback: sleep 1 hour and retry
     }
 
@@ -851,10 +852,26 @@ uint64_t secondsUntilNextActiveWindow() {
     getSunTimes(tomorrow.tm_year + 1900, tomorrow.tm_mon + 1, tomorrow.tm_mday,
                 sunriseMin, sunsetMin);
 
+    // Validate tomorrow's sun times
+    if (sunriseMin < 0 || sunriseMin > 1440 || sunsetMin < 0 || sunsetMin > 1440) {
+        Serial.printf("[Schedule] Invalid tomorrow sun times (sunrise=%.1f, sunset=%.1f) — fallback 1 hour\n",
+            sunriseMin, sunsetMin);
+        return 3600;
+    }
+
     double tomorrowActiveStart = sunriseMin - 60.0;
+    if (tomorrowActiveStart < 0.0) {
+        tomorrowActiveStart = 0.0;
+    }
 
     double minutesUntilTomorrow = (24.0 * 60.0) - nowMin;
     double totalMinutes = minutesUntilTomorrow + tomorrowActiveStart;
+
+    // Sanity: should never be negative or more than ~24 hours away
+    if (totalMinutes <= 0.0 || totalMinutes > 24.0 * 60.0) {
+        Serial.printf("[Schedule] Calculated sleep %.1f min out of range — fallback 1 hour\n", totalMinutes);
+        return 3600;
+    }
 
     uint64_t seconds = (uint64_t)(totalMinutes * 60.0);
     if (seconds < 60) seconds = 60;
@@ -866,8 +883,26 @@ uint64_t secondsUntilNextActiveWindow() {
 }
 
 // ─── Deep Sleep ──────────────────────────────────────────────────────────────
+// Maximum single sleep duration: 2 hours. If we need to sleep longer, the device
+// will wake, quickly re-evaluate the schedule, and go back to sleep. This avoids
+// RTC timer overflow/drift issues on long sleep durations.
+#define MAX_SLEEP_SECONDS  (2ULL * 3600)
+
 void enterDeepSleep(uint64_t sleepSeconds) {
-    Serial.printf("[Sleep] Entering deep sleep for %llu seconds\n", sleepSeconds);
+    // Cap sleep duration to avoid RTC timer reliability issues
+    if (sleepSeconds > MAX_SLEEP_SECONDS) {
+        Serial.printf("[Sleep] Requested %llu s — capping to %llu s (will re-check on wake)\n",
+            sleepSeconds, MAX_SLEEP_SECONDS);
+        sleepSeconds = MAX_SLEEP_SECONDS;
+    }
+
+    // Guard against zero or absurdly small values
+    if (sleepSeconds < 60) {
+        sleepSeconds = 60;
+    }
+
+    Serial.printf("[Sleep] Entering deep sleep for %llu seconds (%.1f hours)\n",
+        sleepSeconds, sleepSeconds / 3600.0);
 
     // Ensure microphone is powered down before sleeping
     digitalWrite(MIC_POWER_PIN, LOW);
