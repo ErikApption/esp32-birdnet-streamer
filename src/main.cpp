@@ -12,6 +12,9 @@
 #include <esp_system.h>
 #include <opus.h>
 
+// Onboard LED
+#define RGB_BUILTIN 48
+
 // ─── I2S Configuration ───────────────────────────────────────────────────────
 #define I2S_WS_PIN        5   // Word Select (LRCLK)
 #define I2S_SD_PIN        6   // Serial Data (DOUT from mic)
@@ -78,6 +81,16 @@ char latitude[12]   = DEFAULT_LATITUDE;
 char longitude[12]  = DEFAULT_LONGITUDE;
 char utcOffset[4]   = DEFAULT_UTC_OFFSET;
 bool sleepEnabled   = false;
+
+// ─── Diagnostic Mode State ────────────────────────────────────────────────────
+bool diagnosticMode = false;  // true when /diag/start has been called
+unsigned long lastDiagTelemetryTime = 0;
+#define DIAG_TELEMETRY_INTERVAL_MS 10000  // Send telemetry every 10s in diagnostic mode
+
+// ─── I2S Signal Monitor State ────────────────────────────────────────────────
+volatile bool i2sSignalDetected = false;  // set by audio task when samples are non-zero
+unsigned long lastSignalCheckTime = 0;
+#define SIGNAL_CHECK_INTERVAL_MS 500  // LED update interval
 
 // ─── Power Monitor State ─────────────────────────────────────────────────────
 float lastBatteryVoltage = 0.0f;  // raw ADC voltage (before divider scaling)
@@ -151,6 +164,9 @@ void getSunTimes(int year, int month, int day, double &sunriseMin, double &sunse
 void powerMonitorInit();
 void readPowerMonitor();
 void sendTelemetryPacket();
+void handleDiagStart();
+void handleDiagStop();
+void updateSignalLed();
 
 // ─── Persistent Settings (NVS) ───────────────────────────────────────────────
 void loadSettings() {
@@ -353,6 +369,8 @@ void httpInit() {
     server.on("/config", HTTP_POST, handlePostConfig);
     server.on("/status", HTTP_GET, handleGetStatus);
     server.on("/sleep", HTTP_POST, handlePostSleep);
+    server.on("/diag/start", HTTP_POST, handleDiagStart);
+    server.on("/diag/stop", HTTP_POST, handleDiagStop);
     server.onNotFound(handleNotFound);
     server.begin();
     Serial.printf("[HTTP] Config server on port %d\n", HTTP_PORT);
@@ -444,15 +462,19 @@ float readAdcVoltage(int pin) {
 }
 
 void readPowerMonitor() {
-    // Enable voltage dividers
-    digitalWrite(MONITOR_EN_PIN, HIGH);
+    // Enable voltage dividers (skip if already HIGH due to diagnostic mode)
+    if (!diagnosticMode) {
+        digitalWrite(MONITOR_EN_PIN, HIGH);
+    }
     delay(2);  // RC settling time
 
     float vBatAdc = readAdcVoltage(VBAT_ADC_PIN);
     float vSolAdc = readAdcVoltage(VSOL_ADC_PIN);
 
-    // Disable voltage dividers
-    digitalWrite(MONITOR_EN_PIN, LOW);
+    // Disable voltage dividers (only if not in diagnostic mode)
+    if (!diagnosticMode) {
+        digitalWrite(MONITOR_EN_PIN, LOW);
+    }
 
     // Store raw ADC voltages (divider scaling applied by the receiver)
     lastBatteryVoltage = vBatAdc;
@@ -481,6 +503,45 @@ void sendTelemetryPacket() {
     udp.beginPacket(resolvedUdpAddr, port);
     udp.write(pkt, TELEMETRY_PACKET_SIZE);
     udp.endPacket();
+}
+
+// ─── Diagnostic Mode Endpoints ───────────────────────────────────────────────
+void handleDiagStart() {
+    diagnosticMode = true;
+    // Set voltage monitor pin HIGH for external measurement
+    digitalWrite(MONITOR_EN_PIN, HIGH);
+    // Enable the onboard LED for signal indication
+    lastSignalCheckTime = millis();
+    lastDiagTelemetryTime = millis();
+    Serial.println("[Diag] Diagnostic mode STARTED — MONITOR_EN_PIN HIGH, LED active");
+    server.send(200, "application/json", "{\"diagnostic\":\"started\",\"monitor_pin\":\"HIGH\",\"led\":\"enabled\"}");
+}
+
+void handleDiagStop() {
+    diagnosticMode = false;
+    // Restore voltage monitor pin to LOW (normal idle state)
+    digitalWrite(MONITOR_EN_PIN, LOW);
+    // Turn off the LED to save power
+    neopixelWrite(RGB_BUILTIN, 0, 0, 0);
+    Serial.println("[Diag] Diagnostic mode STOPPED — MONITOR_EN_PIN LOW, LED off");
+    server.send(200, "application/json", "{\"diagnostic\":\"stopped\",\"monitor_pin\":\"LOW\",\"led\":\"disabled\"}");
+}
+
+// ─── I2S Signal LED Indicator ────────────────────────────────────────────────
+// Uses the onboard RGB LED (GPIO 48) to show I2S microphone signal status.
+// Only active during diagnostic mode to save power.
+//   - RED:   No signal detected (all zeros / silence)
+//   - GREEN: Signal is being received
+void updateSignalLed() {
+    if (!diagnosticMode) return;  // LED stays off outside diagnostic mode
+
+    if (i2sSignalDetected) {
+        neopixelWrite(RGB_BUILTIN, 0, 20, 0);  // Green — signal OK
+    } else {
+        neopixelWrite(RGB_BUILTIN, 20, 0, 0);  // Red — no signal
+    }
+    // Reset the flag; the audio task will set it again if signal is present
+    i2sSignalDetected = false;
 }
 
 // ─── I2S Setup ───────────────────────────────────────────────────────────────
@@ -941,6 +1002,15 @@ void streamAudio() {
         i2sBuffer[i] = (int16_t)(i2sReadBuffer[i] >> 14);
     }
 
+    // Signal detection: check if any samples exceed a noise floor threshold
+    // This drives the onboard LED indicator (red = no signal, green = signal)
+    for (int i = 0; i < samplesRead32; i++) {
+        if (abs(i2sBuffer[i]) > 16) {  // threshold above ADC noise floor
+            i2sSignalDetected = true;
+            break;
+        }
+    }
+
     // Re-resolve the UDP target periodically
     if (resolvedUdpAddr == IPAddress(0, 0, 0, 0) ||
         millis() - lastResolveTime >= RESOLVE_INTERVAL_MS) {
@@ -1207,6 +1277,12 @@ void loop() {
             lastPowerReadTime = millis();
             readPowerMonitor();
             sendTelemetryPacket();
+        }
+
+        // Update onboard LED to reflect I2S signal status
+        if (millis() - lastSignalCheckTime >= SIGNAL_CHECK_INTERVAL_MS) {
+            lastSignalCheckTime = millis();
+            updateSignalLed();
         }
     }
 
