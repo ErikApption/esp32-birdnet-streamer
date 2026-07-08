@@ -85,7 +85,7 @@ bool sleepEnabled   = false;
 // ─── Diagnostic Mode State ────────────────────────────────────────────────────
 bool diagnosticMode = false;  // true when /diag/start has been called
 unsigned long lastDiagTelemetryTime = 0;
-#define DIAG_TELEMETRY_INTERVAL_MS 10000  // Send telemetry every 10s in diagnostic mode
+#define DIAG_TELEMETRY_INTERVAL_MS 2000  // Send telemetry every 2s in diagnostic mode
 
 // ─── I2S Signal Monitor State ────────────────────────────────────────────────
 volatile bool i2sSignalDetected = false;  // set by audio task when samples are non-zero
@@ -333,7 +333,10 @@ void handleGetStatus() {
     json += "\"sunset\":\"" + sunsetStr + "\",";
     json += "\"sleep_enabled\":" + String(sleepEnabled ? "true" : "false") + ",";
     json += "\"ip\":\"" + WiFi.localIP().toString() + "\",";
-    json += "\"rssi\":" + String(WiFi.RSSI());
+    json += "\"rssi\":" + String(WiFi.RSSI()) + ",";
+    json += "\"battery_v\":" + String(lastBatteryVoltage, 3) + ",";
+    json += "\"solar_v\":" + String(lastSolarVoltage, 3) + ",";
+    json += "\"diagnostic\":" + String(diagnosticMode ? "true" : "false");
     json += "}";
     server.send(200, "application/json", json);
 }
@@ -1283,6 +1286,13 @@ void loop() {
         if (millis() - lastSignalCheckTime >= SIGNAL_CHECK_INTERVAL_MS) {
             lastSignalCheckTime = millis();
             updateSignalLed();
+        }
+
+        // In diagnostic mode, send telemetry every 10 seconds
+        if (diagnosticMode && millis() - lastDiagTelemetryTime >= DIAG_TELEMETRY_INTERVAL_MS) {
+            lastDiagTelemetryTime = millis();
+            readPowerMonitor();
+            sendTelemetryPacket();
         }
     }
 
