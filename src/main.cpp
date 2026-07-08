@@ -94,7 +94,11 @@ volatile uint32_t opusFramesEncoded = 0; // Opus frames encoded in current windo
 volatile uint32_t opusFramesSilent = 0;  // Opus frames that encoded as near-silent (very few bytes)
 unsigned long lastSignalCheckTime = 0;
 #define SIGNAL_CHECK_INTERVAL_MS 500  // LED update interval
-#define OPUS_SILENT_THRESHOLD 10      // Opus frames <= this many bytes are silence/comfort noise
+#define OPUS_SILENT_THRESHOLD 80      // Opus frames <= this many bytes are silence/near-silence
+                                      // At 64kbps/60ms, real audio encodes to ~480 bytes.
+                                      // DTX silence = 2-3 bytes, comfort noise = 10-40 bytes,
+                                      // noise from floating/shorted pin = 40-80 bytes.
+                                      // Anything above ~80 bytes has meaningful audio content.
 
 // ─── Power Monitor State ─────────────────────────────────────────────────────
 float lastBatteryVoltage = 0.0f;  // raw ADC voltage (before divider scaling)
@@ -538,8 +542,9 @@ void handleDiagStop() {
 // Uses the onboard RGB LED (GPIO 48) to show audio pipeline health.
 // Only active during diagnostic mode to save power.
 // Error states are latched for a minimum duration so they're visible.
-//   - RED:    Mic off/disconnected (I2S frames empty) or all Opus frames silent
-//   - YELLOW: Intermittent issue — some Opus frames encoding as silence (blank audio)
+//   - RED:    Mic broken — >=50% of I2S frames empty, or >=50% Opus frames silent
+//             (wiring fault: pin shorted to GND, intermittent connection, etc.)
+//   - YELLOW: Degraded — 10-50% of frames failing (marginal connection)
 //   - GREEN:  Healthy — mic active and Opus encoding real audio content
 #define LED_LATCH_DURATION_MS 3000  // Hold error state for at least 3 seconds
 unsigned long ledLatchUntil = 0;    // millis() timestamp when latch expires
@@ -555,27 +560,40 @@ void updateSignalLed() {
 
     // Determine worst status between I2S and Opus levels
     bool i2sDead = (total == 0 || empty == total);
-    bool i2sIntermittent = (empty > 0 && !i2sDead);
     bool opusDead = (opTotal > 0 && opSilent == opTotal);
     bool opusIntermittent = (opTotal > 0 && opSilent > 0 && !opusDead);
 
+    // Classify I2S empty frame ratio into severity tiers:
+    //   - >=50% empty: mic is effectively dead (red) — wiring fault, shorted pin
+    //   - >=10% empty: intermittent connection (yellow) — occasional bad contact
+    //   - <10% empty:  healthy (green) — rare glitches are normal
+    bool i2sMostlyDead = (total > 0 && empty * 2 >= total);       // >=50% empty → red
+    bool i2sIntermittent = (total > 0 && empty > 0 && !i2sMostlyDead
+                           && empty * 10 >= total);                // >=10% empty → yellow
+
+    // Similarly for Opus: if most frames encode as silence, the mic is useless
+    bool opusMostlySilent = (opTotal > 0 && opSilent * 2 >= opTotal);  // >=50% silent → red
+
     // Determine current state
     uint8_t currentState = 0;  // green
-    if (i2sDead || opusDead) {
+    if (i2sDead || opusDead || i2sMostlyDead || opusMostlySilent) {
         currentState = 2;  // red
     } else if (i2sIntermittent || opusIntermittent) {
         currentState = 1;  // yellow
     }
 
-    // Latch: only upgrade severity or refresh latch timer, never downgrade while latched
-    if (currentState > latchedState || currentState >= latchedState) {
-        if (currentState > 0) {
-            latchedState = currentState;
-            ledLatchUntil = millis() + LED_LATCH_DURATION_MS;
-        }
+    // Latch: upgrade severity immediately, or refresh timer at same severity.
+    // Never downgrade while the latch timer is active.
+    if (currentState > latchedState) {
+        // Worse state detected — latch it
+        latchedState = currentState;
+        ledLatchUntil = millis() + LED_LATCH_DURATION_MS;
+    } else if (currentState == latchedState && currentState > 0) {
+        // Same error level persists — keep the latch alive
+        ledLatchUntil = millis() + LED_LATCH_DURATION_MS;
     }
 
-    // If latch has expired, allow return to green
+    // If latch has expired, allow return to the current (possibly better) state
     if (millis() >= ledLatchUntil) {
         latchedState = currentState;
     }
@@ -1055,53 +1073,90 @@ void streamAudio() {
         i2sBuffer[i] = (int16_t)(i2sReadBuffer[i] >> 14);
     }
 
-    // Signal detection: classify this frame as active or empty.
-    // Catches multiple failure modes:
-    //   - SD shorted to ground: all zeros or very low amplitude
-    //   - SD partially shorted: small values from crosstalk (below normal mic output)
-    //   - Stuck data line: identical consecutive samples
-    //   - Mic unpowered: raw values below driven threshold
-    
-    i2sFramesTotal++;
-    
-    // Check raw 32-bit amplitude — real mic signal produces large magnitudes
-    int activeCount = 0;
-    const int32_t RAW_SIGNAL_THRESHOLD = 100000;
-    for (int i = 0; i < samplesRead32; i++) {
-        int32_t raw = i2sReadBuffer[i];
-        if (raw > RAW_SIGNAL_THRESHOLD || raw < -RAW_SIGNAL_THRESHOLD) {
-            activeCount++;
-        }
-    }
-    
-    if (activeCount <= samplesRead32 / 20) {
-        // Mic not driving bus (unpowered, SD shorted to GND, etc.)
-        i2sFramesEmpty++;
-    } else {
-        // Bus is driven — check quality of the 16-bit audio
-        int16_t minVal = i2sBuffer[0], maxVal = i2sBuffer[0];
-        for (int i = 1; i < samplesRead32; i++) {
-            if (i2sBuffer[i] < minVal) minVal = i2sBuffer[i];
-            if (i2sBuffer[i] > maxVal) maxVal = i2sBuffer[i];
-        }
-        int peakToPeak = (int)maxVal - (int)minVal;
+    // Signal quality checks — only run in diagnostic mode to avoid
+    // wasting CPU cycles during normal streaming operation.
+    if (diagnosticMode) {
+        i2sFramesTotal++;
         
-        // Stuck sample detection (data line fault)
-        int maxStuckRun = 0, currentStuckRun = 1;
-        for (int i = 1; i < samplesRead32; i++) {
-            if (i2sBuffer[i] == i2sBuffer[i - 1]) {
-                currentStuckRun++;
-                if (currentStuckRun > maxStuckRun) maxStuckRun = currentStuckRun;
-            } else {
-                currentStuckRun = 1;
+        // Check raw 32-bit amplitude — real mic signal produces large magnitudes.
+        // A properly connected INMP441 drives the bus on most samples, not just a few.
+        // Intermittent wiring produces occasional spikes but fails the majority test.
+        int activeCount = 0;
+        const int32_t RAW_SIGNAL_THRESHOLD = 100000;
+        for (int i = 0; i < samplesRead32; i++) {
+            int32_t raw = i2sReadBuffer[i];
+            if (raw > RAW_SIGNAL_THRESHOLD || raw < -RAW_SIGNAL_THRESHOLD) {
+                activeCount++;
             }
         }
         
-        // A healthy INMP441 produces peak-to-peak > 50 even in silence (self-noise).
-        // Lower than that indicates SD is partially shorted or heavily attenuated.
-        // Stuck runs > 25% indicate the data line is not transitioning properly.
-        if (peakToPeak < 50 || maxStuckRun > samplesRead32 / 4) {
+        // Require at least 10% of samples above threshold.
+        // An intermittent SD pin might produce sporadic spikes from noise coupling
+        // that pass a 5% threshold but fail at 10%.
+        if (activeCount <= samplesRead32 / 10) {
+            // Mic not driving bus (unpowered, SD shorted to GND, intermittent, etc.)
             i2sFramesEmpty++;
+        } else {
+            // Bus appears driven — perform structural checks on the 16-bit audio.
+            // These detect hardware faults (stuck lines, shorted pins) without
+            // false-triggering on legitimate quiet audio.
+            int16_t minVal = i2sBuffer[0], maxVal = i2sBuffer[0];
+            int64_t sum = 0;
+            for (int i = 0; i < samplesRead32; i++) {
+                if (i2sBuffer[i] < minVal) minVal = i2sBuffer[i];
+                if (i2sBuffer[i] > maxVal) maxVal = i2sBuffer[i];
+                sum += i2sBuffer[i];
+            }
+            int peakToPeak = (int)maxVal - (int)minVal;
+            int16_t dcOffset = (int16_t)(sum / samplesRead32);
+            
+            // Stuck sample detection (data line fault — SCK or SD not toggling)
+            int maxStuckRun = 0, currentStuckRun = 1;
+            for (int i = 1; i < samplesRead32; i++) {
+                if (i2sBuffer[i] == i2sBuffer[i - 1]) {
+                    currentStuckRun++;
+                    if (currentStuckRun > maxStuckRun) maxStuckRun = currentStuckRun;
+                } else {
+                    currentStuckRun = 1;
+                }
+            }
+            
+            // Fault conditions (any one is sufficient to mark frame empty):
+            //
+            // 1. Stuck line: >25% consecutive identical samples means the data
+            //    line is not transitioning. Normal audio never produces this.
+            bool stuckLine = (maxStuckRun > samplesRead32 / 4);
+            
+            // 2. DC rail: large DC offset means SD is pulled to VDD or GND.
+            //    INMP441 in I2S mode outputs near-zero DC. A bias above ±5000
+            //    in the 16-bit domain (after >>14) indicates a shorted pin.
+            bool badDcBias = (dcOffset > 5000 || dcOffset < -5000);
+            
+            // 3. Completely flat: peak-to-peak == 0 means every sample is identical
+            //    (different from stuck runs — this catches the entire buffer being
+            //    one value, e.g. all zeros from an unpowered mic that passed the
+            //    raw threshold due to noise on the bus lines).
+            bool totallyFlat = (peakToPeak == 0);
+            
+            // 4. Uncorrelated noise: a floating or shorted SD pin produces random
+            //    noise with near-zero lag-1 autocorrelation. Real audio at 48kHz
+            //    is heavily band-limited and has strong sample-to-sample correlation
+            //    (typically >0.5, often >0.9). Random bus noise is <0.1.
+            //    This is the key test for "sounds blank but has energy."
+            int64_t crossSum = 0;
+            int64_t autoSum = 0;
+            for (int i = 1; i < samplesRead32; i++) {
+                crossSum += (int64_t)i2sBuffer[i] * (int64_t)i2sBuffer[i - 1];
+                autoSum  += (int64_t)i2sBuffer[i] * (int64_t)i2sBuffer[i];
+            }
+            // correlation < 0.3 means the signal lacks temporal structure
+            // (using 0.3 instead of 0.1 to catch partially-connected pins that
+            // produce some correlated content mixed with noise)
+            bool uncorrelatedNoise = (autoSum > 0 && crossSum * 10 < autoSum * 3);
+            
+            if (stuckLine || badDcBias || totallyFlat || uncorrelatedNoise) {
+                i2sFramesEmpty++;
+            }
         }
     }
 
@@ -1150,9 +1205,11 @@ void streamAudio() {
 
             // Track Opus output size for diagnostic LED — very small frames
             // indicate the encoder received silence/blank input
-            opusFramesEncoded++;
-            if (encodedBytes <= OPUS_SILENT_THRESHOLD) {
-                opusFramesSilent++;
+            if (diagnosticMode) {
+                opusFramesEncoded++;
+                if (encodedBytes <= OPUS_SILENT_THRESHOLD) {
+                    opusFramesSilent++;
+                }
             }
 
             // Check if this frame fits in the current packet buffer
