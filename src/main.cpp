@@ -6,7 +6,7 @@
 #include <WebServer.h>
 #include <ESPmDNS.h>
 #include <Preferences.h>
-#include <driver/i2s.h>
+#include <driver/i2s_std.h>
 #include <time.h>
 #include <sunset.h>
 #include <esp_system.h>
@@ -16,14 +16,11 @@
 #define I2S_WS_PIN        5   // Word Select (LRCLK)
 #define I2S_SD_PIN        6   // Serial Data (DOUT from mic)
 #define I2S_SCK_PIN       4   // Serial Clock (BCLK)
-#define I2S_PORT          I2S_NUM_0
 
 // ─── Microphone Power Pin ────────────────────────────────────────────────────
 #define MIC_POWER_PIN     10  // GPIO powering INMP441 VDD (~1.4 mA)
 
 #define DEFAULT_SAMPLE_RATE 48000
-#define SAMPLE_BITS       I2S_BITS_PER_SAMPLE_32BIT
-#define I2S_CHANNEL_FMT   I2S_CHANNEL_FMT_ONLY_LEFT
 #define DMA_BUF_COUNT     8
 #define DMA_BUF_LEN       1024
 
@@ -96,6 +93,7 @@ bool configured     = false;  // true once a config has been received (persisted
 
 static int32_t i2sReadBuffer[DMA_BUF_LEN];  // 32-bit I2S read buffer
 static int16_t i2sBuffer[DMA_BUF_LEN];     // 16-bit samples after bit-shift conversion
+static i2s_chan_handle_t rx_handle = NULL;  // New I2S driver channel handle
 
 // ─── Opus Encoder Globals ────────────────────────────────────────────────────
 OpusEncoder *opusEncoder = nullptr;
@@ -151,6 +149,7 @@ void getSunTimes(int year, int month, int day, double &sunriseMin, double &sunse
 void powerMonitorInit();
 void readPowerMonitor();
 void sendTelemetryPacket();
+float readAdcVoltage(int pin);
 
 // ─── Persistent Settings (NVS) ───────────────────────────────────────────────
 void loadSettings() {
@@ -317,7 +316,11 @@ void handleGetStatus() {
     json += "\"sunset\":\"" + sunsetStr + "\",";
     json += "\"sleep_enabled\":" + String(sleepEnabled ? "true" : "false") + ",";
     json += "\"ip\":\"" + WiFi.localIP().toString() + "\",";
-    json += "\"rssi\":" + String(WiFi.RSSI());
+    json += "\"rssi\":" + String(WiFi.RSSI()) + ",";
+    json += "\"battery_adc_v\":" + String(lastBatteryVoltage, 3) + ",";
+    json += "\"solar_adc_v\":" + String(lastSolarVoltage, 3) + ",";
+    json += "\"battery_v\":" + String(lastBatteryVoltage * 2.0f, 2) + ",";
+    json += "\"solar_v\":" + String(lastSolarVoltage * 3.2f, 2);
     json += "}";
     server.send(200, "application/json", json);
 }
@@ -431,6 +434,70 @@ void powerMonitorInit() {
     analogSetAttenuation(ADC_11db);     // 0–3.1V range
     analogReadResolution(12);           // 12-bit (0–4095)
     Serial.println("[Power] Monitor initialized");
+
+    // ─── Self-test: diagnose voltage divider wiring ─────────────────────
+    Serial.println("[Power] ┌─── DIAGNOSTIC SELF-TEST ───────────────────────┐");
+
+    // Step 1: Read with MOSFET OFF — both ADC pins should read near 0V
+    // (no current path through dividers, pins should be at ground potential
+    //  through R2/R4 if wired correctly, or floating if ground path is broken)
+    digitalWrite(MONITOR_EN_PIN, LOW);
+    delay(10);
+    float batOff = readAdcVoltage(VBAT_ADC_PIN);
+    float solOff = readAdcVoltage(VSOL_ADC_PIN);
+    Serial.printf("[Power] │ MOSFET OFF  — bat ADC: %.3fV, sol ADC: %.3fV\n", batOff, solOff);
+
+    if (batOff > 0.1f || solOff > 0.1f) {
+        Serial.println("[Power] │ ⚠ PROBLEM: ADC reads >0.1V with MOSFET off!");
+        Serial.println("[Power] │   Expected: ~0V (divider has no ground path)");
+        Serial.println("[Power] │   If reading near 3.0V: pins are floating (broken GND wiring)");
+        Serial.println("[Power] │   If reading 1-2V: possible leakage or wrong pin connection");
+    } else {
+        Serial.println("[Power] │ ✓ OK — pins near 0V when dividers disabled");
+    }
+
+    // Step 2: Read with MOSFET ON — should see actual divided voltages
+    digitalWrite(MONITOR_EN_PIN, HIGH);
+    delay(5);  // settling time
+    float batOn = readAdcVoltage(VBAT_ADC_PIN);
+    float solOn = readAdcVoltage(VSOL_ADC_PIN);
+    Serial.printf("[Power] │ MOSFET ON   — bat ADC: %.3fV, sol ADC: %.3fV\n", batOn, solOn);
+
+    // Expected battery ADC for 3S NiMH: 1.5V–2.25V (3.0V–4.5V / 2)
+    float batReal = batOn * 2.0f;
+    float solReal = solOn * 3.2f;
+    Serial.printf("[Power] │ Calculated  — bat: %.2fV, sol: %.2fV\n", batReal, solReal);
+
+    if (batReal > 4.5f) {
+        Serial.println("[Power] │ ⚠ PROBLEM: Battery reads > 4.5V (impossible for 3S NiMH)");
+        Serial.println("[Power] │   Check: is battery sense wire on correct terminal?");
+        Serial.println("[Power] │   Check: is MOSFET drain connected to divider ground?");
+    } else if (batReal < 2.5f) {
+        Serial.println("[Power] │ ⚠ WARNING: Battery reads < 2.5V (cells may be dead)");
+    } else {
+        Serial.printf("[Power] │ ✓ OK — battery %.2fV is within 3S NiMH range (3.0–4.5V)\n", batReal);
+    }
+
+    if (solReal > 0.5f) {
+        Serial.printf("[Power] │ ℹ Solar panel reading: %.2fV\n", solReal);
+    } else {
+        Serial.println("[Power] │ ℹ Solar: no voltage detected (panel disconnected or dark)");
+    }
+
+    // Step 3: Check that switching actually changes the reading
+    float batDelta = fabsf(batOn - batOff);
+    float solDelta = fabsf(solOn - solOff);
+    Serial.printf("[Power] │ Delta (on-off) — bat: %.3fV, sol: %.3fV\n", batDelta, solDelta);
+
+    if (batDelta < 0.05f) {
+        Serial.println("[Power] │ ⚠ PROBLEM: Battery ADC doesn't change with MOSFET!");
+        Serial.println("[Power] │   MOSFET may not be switching, or divider not connected.");
+        Serial.println("[Power] │   Check: GPIO 7 → MOSFET gate, drain → R2+R4 bottom, source → GND");
+    }
+
+    // Disable dividers
+    digitalWrite(MONITOR_EN_PIN, LOW);
+    Serial.println("[Power] └────────────────────────────────────────────────┘");
 }
 
 float readAdcVoltage(int pin) {
@@ -490,39 +557,50 @@ void i2sInit() {
     digitalWrite(MIC_POWER_PIN, HIGH);
     delay(100);  // Allow mic to stabilize after power-on
 
-    i2s_config_t i2sConfig = {
-        .mode = (i2s_mode_t)(I2S_MODE_MASTER | I2S_MODE_RX),
-        .sample_rate = sampleRate,
-        .bits_per_sample = SAMPLE_BITS,
-        .channel_format = I2S_CHANNEL_FMT,
-        .communication_format = I2S_COMM_FORMAT_STAND_I2S,
-        .intr_alloc_flags = ESP_INTR_FLAG_LEVEL1,
-        .dma_buf_count = DMA_BUF_COUNT,
-        .dma_buf_len = DMA_BUF_LEN,
-        .use_apll = true,
-        .tx_desc_auto_clear = false,
-        .fixed_mclk = 0
-    };
+    // Create RX channel
+    i2s_chan_config_t chan_cfg = I2S_CHANNEL_DEFAULT_CONFIG(I2S_NUM_0, I2S_ROLE_MASTER);
+    chan_cfg.dma_desc_num = DMA_BUF_COUNT;
+    chan_cfg.dma_frame_num = DMA_BUF_LEN;
 
-    i2s_pin_config_t pinConfig = {
-        .bck_io_num = I2S_SCK_PIN,
-        .ws_io_num = I2S_WS_PIN,
-        .data_out_num = I2S_PIN_NO_CHANGE,
-        .data_in_num = I2S_SD_PIN
-    };
-
-    esp_err_t err = i2s_driver_install(I2S_PORT, &i2sConfig, 0, NULL);
+    esp_err_t err = i2s_new_channel(&chan_cfg, NULL, &rx_handle);
     if (err != ESP_OK) {
-        Serial.printf("[I2S] Driver install failed: %d\n", err);
+        Serial.printf("[I2S] Channel creation failed: %d\n", err);
+        return;
     }
 
-    err = i2s_set_pin(I2S_PORT, &pinConfig);
+    // Configure standard mode for INMP441 (Philips/I2S format, 32-bit, mono left)
+    i2s_std_config_t std_cfg = {
+        .clk_cfg = I2S_STD_CLK_DEFAULT_CONFIG(sampleRate),
+        .slot_cfg = I2S_STD_PHILIPS_SLOT_DEFAULT_CONFIG(I2S_DATA_BIT_WIDTH_32BIT, I2S_SLOT_MODE_MONO),
+        .gpio_cfg = {
+            .mclk = I2S_GPIO_UNUSED,
+            .bclk = (gpio_num_t)I2S_SCK_PIN,
+            .ws = (gpio_num_t)I2S_WS_PIN,
+            .dout = I2S_GPIO_UNUSED,
+            .din = (gpio_num_t)I2S_SD_PIN,
+            .invert_flags = {
+                .mclk_inv = false,
+                .bclk_inv = false,
+                .ws_inv = false,
+            },
+        },
+    };
+    // INMP441 outputs on the left channel when WS is low
+    std_cfg.slot_cfg.slot_mask = I2S_STD_SLOT_LEFT;
+
+    err = i2s_channel_init_std_mode(rx_handle, &std_cfg);
     if (err != ESP_OK) {
-        Serial.printf("[I2S] Set pin failed: %d\n", err);
+        Serial.printf("[I2S] Std mode init failed: %d\n", err);
+        return;
     }
 
-    i2s_zero_dma_buffer(I2S_PORT);
-    Serial.println("[I2S] Initialized");
+    err = i2s_channel_enable(rx_handle);
+    if (err != ESP_OK) {
+        Serial.printf("[I2S] Channel enable failed: %d\n", err);
+        return;
+    }
+
+    Serial.println("[I2S] Initialized (new driver)");
 }
 
 // ─── Opus Encoder Setup ──────────────────────────────────────────────────────
@@ -601,47 +679,136 @@ void otaInit() {
 }
 
 // ─── WiFi Setup via WiFiManager ──────────────────────────────────────────────
+
+// Attempt a single WiFi connection with the given timeout (ms).
+// Returns true if connected.
+bool wifiTryConnect(const char* ssid, const char* password, unsigned long timeoutMs) {
+    WiFi.begin(ssid, password);
+    unsigned long start = millis();
+    while (WiFi.status() != WL_CONNECTED && (millis() - start) < timeoutMs) {
+        delay(250);
+        Serial.print(".");
+    }
+    Serial.println();
+    return WiFi.status() == WL_CONNECTED;
+}
+
+// Hard-reset the WiFi radio — clears stuck state from deep sleep/brownout
+void wifiRadioReset() {
+    WiFi.disconnect(true, false);  // disconnect + clear STA config, keep NVS creds
+    WiFi.mode(WIFI_OFF);
+    delay(500);                    // let the radio fully power down
+    WiFi.mode(WIFI_STA);
+    delay(200);
+}
+
 void wifiInit() {
     Serial.println("[WiFi] Initializing...");
 
-    // Set hostname BEFORE WiFi.mode() and WiFi.begin() — this is what the
-    // DHCP client sends to the router so the device shows up with a
-    // human-readable name in the router's client list.
+    // ─── Step 1: Fully power-cycle the radio ─────────────────────────────────
+    // The ESP32-S3 WiFi radio often fails to associate on first boot after
+    // deep sleep or power-on. A full OFF→STA cycle forces the RF calibration
+    // to run fresh. We do NOT call WiFi.disconnect(true) here because that
+    // erases the stored STA config that WiFiManager saved last time.
+    WiFi.mode(WIFI_OFF);
+    delay(500);
+    WiFi.mode(WIFI_STA);
+    delay(200);
+
+    // Set hostname BEFORE WiFi.begin() — this is what the DHCP client sends
+    // to the router so the device shows up with a human-readable name.
     WiFi.setHostname(MDNS_HOSTNAME);
     Serial.printf("[WiFi] Hostname set to: %s\n", MDNS_HOSTNAME);
+
+    // Disable WiFi modem sleep — keeps the radio active during connection,
+    // preventing DTIM-related association timeouts on some routers.
+    WiFi.setSleep(false);
+
+    // Set WiFi TX power to max for reliable connection at distance
+    WiFi.setTxPower(WIFI_POWER_19_5dBm);
 
     // Print MAC address early — useful for identifying the device on the router
     Serial.printf("[WiFi] MAC Address: %s\n", WiFi.macAddress().c_str());
 
-#if defined(WIFI_SSID) && defined(WIFI_PASSWORD)
-    // Compile-time credentials provided — try connecting directly first
-    Serial.printf("[WiFi] Connecting to '%s' (build-time credentials)...\n", WIFI_SSID);
-    WiFi.mode(WIFI_STA);
-    WiFi.begin(WIFI_SSID, WIFI_PASSWORD);
+    // ─── Step 2: Try connecting with stored credentials (fast path) ──────────
+    // Before involving WiFiManager, try a direct WiFi.begin() which uses the
+    // credentials stored in ESP32 NVS by a previous successful connection.
+    // This avoids WiFiManager's overhead and is the path that usually works
+    // on the 2nd/3rd reboot — we just need to give it enough time.
+    Serial.println("[WiFi] Trying stored credentials (fast path)...");
 
-    int retries = 0;
-    while (WiFi.status() != WL_CONNECTED && retries < 40) {
-        delay(500);
+    WiFi.begin();  // No args = use NVS-stored SSID/password
+
+    // Wait up to 15 seconds for association + DHCP
+    unsigned long start = millis();
+    while (WiFi.status() != WL_CONNECTED && (millis() - start) < 15000) {
+        delay(250);
         Serial.print(".");
-        retries++;
     }
     Serial.println();
 
+    if (WiFi.status() == WL_CONNECTED) {
+        Serial.println("[WiFi] Connected via stored credentials (fast path)");
+    }
+
+#if defined(WIFI_SSID) && defined(WIFI_PASSWORD)
+    // Compile-time credentials provided — try if stored creds didn't work
     if (WiFi.status() != WL_CONNECTED) {
-        Serial.printf("[WiFi] Build-time credentials failed (status=%d) — falling back to captive portal\n",
-            WiFi.status());
-        WiFi.disconnect(true);
-        delay(100);
+        Serial.printf("[WiFi] Trying build-time credentials '%s'...\n", WIFI_SSID);
+
+        const int maxAttempts = 3;
+        const unsigned long timeouts[] = { 15000, 20000, 30000 };
+
+        for (int attempt = 0; attempt < maxAttempts; attempt++) {
+            Serial.printf("[WiFi] Attempt %d/%d (timeout %lums)...\n",
+                attempt + 1, maxAttempts, timeouts[attempt]);
+
+            if (wifiTryConnect(WIFI_SSID, WIFI_PASSWORD, timeouts[attempt])) {
+                break;
+            }
+
+            Serial.printf("[WiFi] Attempt %d failed (status=%d)\n", attempt + 1, WiFi.status());
+
+            if (attempt < maxAttempts - 1) {
+                Serial.println("[WiFi] Resetting radio before retry...");
+                wifiRadioReset();
+                WiFi.setHostname(MDNS_HOSTNAME);
+                WiFi.setSleep(false);
+                delay(1000);
+            }
+        }
+
+        if (WiFi.status() != WL_CONNECTED) {
+            Serial.println("[WiFi] Build-time credentials exhausted");
+            wifiRadioReset();
+            WiFi.setHostname(MDNS_HOSTNAME);
+            delay(500);
+        }
     }
 #endif
 
-    // If not yet connected (no build-time creds, or they failed), use WiFiManager
+    // ─── Step 3: WiFiManager (portal fallback) ───────────────────────────────
     if (WiFi.status() != WL_CONNECTED) {
-        Serial.println("[WiFi] Starting WiFiManager captive portal...");
-        WiFiManager wm;
+        Serial.println("[WiFi] Starting WiFiManager...");
 
-        // Set WiFiManager hostname so it also propagates during portal mode
+        // Reset radio cleanly before WiFiManager takes over
+        wifiRadioReset();
+        WiFi.setHostname(MDNS_HOSTNAME);
+        WiFi.setSleep(false);
+        delay(500);
+
+        WiFiManager wm;
         wm.setHostname(MDNS_HOSTNAME);
+
+        // Key reliability settings for WiFiManager:
+        wm.setConnectTimeout(30);     // 30s per attempt (default is too short for some routers)
+        wm.setConnectRetries(5);      // 5 retries with saved creds before opening portal
+        wm.setCleanConnect(true);     // disconnect before each attempt (fixes stuck radio state)
+        wm.setSaveConnect(true);      // persist successful connection in NVS
+        wm.setWiFiAutoReconnect(true); // enable ESP32 auto-reconnect after WiFiManager exits
+
+        // Debug output helps diagnose connection issues in serial monitor
+        wm.setDebugOutput(true, "WM: ");
 
         WiFiManagerParameter customUdpHost("udp_host", "UDP Host", udpHost, sizeof(udpHost));
         WiFiManagerParameter customUdpPort("udp_port", "UDP Port", udpPort, sizeof(udpPort));
@@ -663,8 +830,8 @@ void wifiInit() {
         bool connected = wm.autoConnect("BirdNet-Setup");
 
         if (!connected) {
-            Serial.println("[WiFi] Failed to connect — restarting in 3s");
-            delay(3000);
+            Serial.println("[WiFi] All connection methods failed — restarting in 5s");
+            delay(5000);
             ESP.restart();
         }
 
@@ -697,6 +864,10 @@ void wifiInit() {
     }
 
     // ─── Connection established — print full network details ─────────────────
+    // Enable ESP32 auto-reconnect — if the radio drops, it will automatically
+    // try to reconnect without needing our loop() watchdog to notice first.
+    WiFi.setAutoReconnect(true);
+
     Serial.println("[WiFi] ╔══════════════════════════════════════════════╗");
     Serial.println("[WiFi] ║         CONNECTED SUCCESSFULLY              ║");
     Serial.println("[WiFi] ╚══════════════════════════════════════════════╝");
@@ -894,7 +1065,7 @@ void udpInit() {
 void streamAudio() {
     size_t bytesRead = 0;
 
-    esp_err_t err = i2s_read(I2S_PORT, i2sReadBuffer, sizeof(i2sReadBuffer), &bytesRead, portMAX_DELAY);
+    esp_err_t err = i2s_channel_read(rx_handle, i2sReadBuffer, sizeof(i2sReadBuffer), &bytesRead, portMAX_DELAY);
     if (err != ESP_OK || bytesRead == 0) {
         return;
     }
@@ -1042,8 +1213,12 @@ void burstSendPackets() {
 // ─── Main ────────────────────────────────────────────────────────────────────
 #define SCHEDULE_CHECK_INTERVAL_MS  (5 * 60 * 1000)
 #define MDNS_ANNOUNCE_INTERVAL_MS   (120 * 1000)  // Re-advertise mDNS every 2 minutes
+#define WIFI_CHECK_INTERVAL_MS      (30 * 1000)   // Check WiFi connectivity every 30s
+#define WIFI_RECONNECT_MAX_ATTEMPTS 5             // Max reconnect attempts before reboot
 unsigned long lastScheduleCheck = 0;
 unsigned long lastMdnsAnnounce = 0;
+unsigned long lastWifiCheck = 0;
+int wifiReconnectAttempts = 0;
 bool streamingStarted = false;
 TaskHandle_t audioTaskHandle = nullptr;
 
@@ -1141,6 +1316,38 @@ void setup() {
 void loop() {
     ArduinoOTA.handle();
     server.handleClient();
+
+    // ─── WiFi watchdog: detect disconnection and auto-reconnect ──────────
+    if (millis() - lastWifiCheck >= WIFI_CHECK_INTERVAL_MS) {
+        lastWifiCheck = millis();
+        if (WiFi.status() != WL_CONNECTED) {
+            wifiReconnectAttempts++;
+            Serial.printf("[WiFi] Disconnected! Reconnect attempt %d/%d...\n",
+                wifiReconnectAttempts, WIFI_RECONNECT_MAX_ATTEMPTS);
+
+            WiFi.disconnect(false);
+            delay(100);
+            WiFi.begin();  // reconnect using stored credentials
+
+            // Wait up to 10s for reconnection
+            unsigned long start = millis();
+            while (WiFi.status() != WL_CONNECTED && (millis() - start) < 10000) {
+                delay(250);
+            }
+
+            if (WiFi.status() == WL_CONNECTED) {
+                Serial.printf("[WiFi] Reconnected! IP: %s, RSSI: %d\n",
+                    WiFi.localIP().toString().c_str(), WiFi.RSSI());
+                wifiReconnectAttempts = 0;
+            } else if (wifiReconnectAttempts >= WIFI_RECONNECT_MAX_ATTEMPTS) {
+                Serial.println("[WiFi] Too many reconnect failures — rebooting");
+                delay(1000);
+                ESP.restart();
+            }
+        } else {
+            wifiReconnectAttempts = 0;  // reset counter when connected
+        }
+    }
 
     // If we just got configured, transition to streaming
     if (configured && !streamingStarted) {

@@ -19,7 +19,7 @@ ESP32-triggered voltage monitoring for a 3S NiMH battery pack and 7V solar panel
 
 ### Simplified Schematic (N-channel approach — recommended)
 
-Using an **IRLZ44N** logic-level N-channel MOSFET on the low side:
+Using a **FQP30N06L** logic-level N-channel MOSFET on the low side:
 
 ```
                    VBAT (+)              VSOLAR (+)
@@ -47,7 +47,7 @@ Using an **IRLZ44N** logic-level N-channel MOSFET on the low side:
                                       │
                                       D (Drain)
                                  ┌────┴────┐
-                                 │  Q1     │  IRLZ44N
+                                 │  Q1     │  FQP30N06L
                                  │         │  (TO-220)
                                  └────┬────┘
                                  G    │ S
@@ -69,7 +69,7 @@ Using an **IRLZ44N** logic-level N-channel MOSFET on the low side:
 
 ## Component Selection
 
-Using parts from available stock. **Recommended: IRLZ44N** (N-channel logic-level MOSFET).
+Using parts from available stock. **Selected: FQP30N06L** (N-channel logic-level MOSFET).
 
 | Ref | Part        | Value   | Purpose                        | Notes                                       |
 |-----|-------------|---------|--------------------------------|---------------------------------------------|
@@ -78,7 +78,7 @@ Using parts from available stock. **Recommended: IRLZ44N** (N-channel logic-leve
 | R3  | Resistor    | 220kΩ   | Solar divider upper            | 1% tolerance                                |
 | R4  | Resistor    | 100kΩ   | Solar divider lower            | 1% tolerance                                |
 | R5  | Resistor    | 10kΩ    | Gate pull-down (keeps Q1 off)  | Ensures MOSFET is off during ESP32 boot/sleep |
-| Q1  | N-MOSFET    | **IRLZ44N** | Low-side switch            | Logic-level, Vgs(th) 1–2V, fully on at 3.3V |
+| Q1  | N-MOSFET    | **FQP30N06L** | Low-side switch            | Logic-level, Vgs(th) 1–2V, fully on at 3.3V |
 | C1  | Capacitor   | 100nF   | ADC filter on GPIO 8           | Polarized: (+) to VBAT_SENSE, (−) to SW_GND |
 | C2  | Capacitor   | 100nF   | ADC filter on GPIO 9           | Polarized: (+) to VSOL_SENSE, (−) to SW_GND |
 
@@ -86,13 +86,13 @@ Using parts from available stock. **Recommended: IRLZ44N** (N-channel logic-leve
 
 | Part        | Type      | Vgs(th) | Rds(on)   | Works at 3.3V? | Verdict                                |
 |-------------|-----------|---------|-----------|----------------|----------------------------------------|
-| **IRLZ44N** | N-ch logic| 1–2V    | 0.022Ω    | ✓ Yes          | **Best choice** — guaranteed on at 3.3V |
-| **FQP30N06L** | N-ch logic| 1–2V  | 0.035Ω    | ✓ Yes          | Also excellent, interchangeable        |
+| **FQP30N06L** | N-ch logic| 1–2V  | 0.035Ω    | ✓ Yes          | **Selected** — logic-level, guaranteed on at 3.3V |
+| **IRLZ44N** | N-ch logic| 1–2V    | 0.022Ω    | ✓ Yes          | Also excellent, interchangeable        |
 | **BS250**   | P-ch      | -1 to -3.5V | 14Ω  | ⚠ Marginal     | Max threshold -3.5V is too close to 3.3V; some units may not fully turn on |
 | **VP3203**  | P-ch      | -1 to -3V | 0.6Ω    | ✓ Yes          | Good P-channel option (high-side switch alternative) |
 | **LP0701**  | —         | —       | —         | ?              | Unable to verify — uncommon part number |
 
-**Why IRLZ44N wins**: It's a logic-level N-channel MOSFET. The "LZ" suffix means it's specifically designed for logic-level gate drive. At Vgs = 3.3V it's well past threshold and has extremely low on-resistance. Yes, it's rated for 47A which is absurd for 50µA, but that's irrelevant — it works, it's reliable, and the gate leakage is negligible.
+**Why FQP30N06L**: It's a logic-level N-channel MOSFET. The "L" suffix means it's specifically designed for logic-level gate drive. At Vgs = 3.3V it's well past threshold and has very low on-resistance (35mΩ). Yes, it's rated for 30A which is absurd for 50µA, but that's irrelevant — it works, it's reliable, and the gate leakage is negligible.
 
 **Alternative — VP3203 as high-side switch**: If you prefer to switch the supply rail instead of ground, the VP3203 can work as a P-channel high-side switch. Wire its source to the voltage being measured, gate to GPIO (through a level-shift consideration), and drain to the divider top. However, for simplicity, the N-channel low-side approach is recommended.
 
@@ -136,100 +136,7 @@ Total when measuring: ~44 µA (negligible, and only during the brief measurement
 
 These GPIOs are free on the ESP32-S3-DevKitC-1 and are on ADC1 (which remains available when WiFi is active — ADC2 is not usable with WiFi).
 
-## Firmware Implementation
 
-```cpp
-// ─── Power Monitor Configuration ─────────────────────────────────────────────
-#define MONITOR_EN_PIN    7   // GPIO to enable voltage dividers
-#define VBAT_ADC_PIN      8   // ADC1_CH7 — battery voltage
-#define VSOL_ADC_PIN      9   // ADC1_CH8 — solar voltage
-
-// Divider ratios (inverse of the scaling factor to recover real voltage)
-#define VBAT_DIVIDER_RATIO  2.0    // V_real = V_adc × 2.0
-#define VSOL_DIVIDER_RATIO  3.2    // V_real = V_adc × 3.2
-
-// ESP32-S3 ADC reference (11dB attenuation, ~0–3.1V range mapped to 0–4095)
-#define ADC_VREF          3.1
-#define ADC_RESOLUTION    4095.0
-
-// Number of samples to average for noise reduction
-#define ADC_SAMPLES       16
-
-// ─── Power Monitor Functions ─────────────────────────────────────────────────
-
-void powerMonitorInit() {
-    pinMode(MONITOR_EN_PIN, OUTPUT);
-    digitalWrite(MONITOR_EN_PIN, LOW);  // Dividers OFF by default
-
-    // Configure ADC
-    analogSetAttenuation(ADC_11db);     // 0–3.1V range
-    analogReadResolution(12);           // 12-bit (0–4095)
-}
-
-float readAdcVoltage(int pin) {
-    uint32_t sum = 0;
-    for (int i = 0; i < ADC_SAMPLES; i++) {
-        sum += analogRead(pin);
-        delayMicroseconds(100);
-    }
-    float avgRaw = (float)sum / ADC_SAMPLES;
-    return (avgRaw / ADC_RESOLUTION) * ADC_VREF;
-}
-
-struct PowerReadings {
-    float batteryVoltage;   // actual battery voltage in V
-    float solarVoltage;     // actual solar panel voltage in V
-    float batteryPercent;   // estimated SoC (0–100%)
-};
-
-PowerReadings readPowerMonitor() {
-    PowerReadings readings;
-
-    // Enable voltage dividers
-    digitalWrite(MONITOR_EN_PIN, HIGH);
-    delay(2);  // allow RC settling (100kΩ × 100nF = 10ms τ, 2ms ≈ sufficient for 12-bit)
-
-    // Read ADC values
-    float vBatAdc = readAdcVoltage(VBAT_ADC_PIN);
-    float vSolAdc = readAdcVoltage(VSOL_ADC_PIN);
-
-    // Disable voltage dividers immediately
-    digitalWrite(MONITOR_EN_PIN, LOW);
-
-    // Calculate actual voltages
-    readings.batteryVoltage = vBatAdc * VBAT_DIVIDER_RATIO;
-    readings.solarVoltage   = vSolAdc * VSOL_DIVIDER_RATIO;
-
-    // Estimate battery percentage (linear approximation for NiMH)
-    // 3S NiMH: 3.0V = empty, 3.6V = ~50%, 4.2V = full
-    float pct = (readings.batteryVoltage - 3.0) / (4.2 - 3.0) * 100.0;
-    readings.batteryPercent = constrain(pct, 0.0, 100.0);
-
-    return readings;
-}
-```
-
-### Integration with existing code
-
-Add to `setup()`:
-```cpp
-powerMonitorInit();
-```
-
-Add to the `/status` endpoint or a new `/power` endpoint:
-```cpp
-void handleGetPower() {
-    PowerReadings pwr = readPowerMonitor();
-
-    String json = "{";
-    json += "\"battery_voltage\":" + String(pwr.batteryVoltage, 2) + ",";
-    json += "\"battery_percent\":" + String(pwr.batteryPercent, 1) + ",";
-    json += "\"solar_voltage\":" + String(pwr.solarVoltage, 2) + ",";
-    json += "\"solar_active\":" + String(pwr.solarVoltage > 1.0 ? "true" : "false");
-    json += "}";
-    server.send(200, "application/json", json);
-}
-```
 
 ### Deep sleep compatibility
 
@@ -251,16 +158,16 @@ During deep sleep, all GPIOs default to Hi-Z. The 10kΩ pull-down on Q1's gate e
 | 3   | Resistor 100kΩ 1%    | any     | generic  |
 | 1   | Resistor 220kΩ 1%    | any     | generic  |
 | 1   | Resistor 10kΩ        | any     | generic  |
-| 1   | **IRLZ44N** N-MOSFET | TO-220  | from stock |
+| 1   | **FQP30N06L** N-MOSFET | TO-220  | from stock |
 | 2   | 100nF capacitor (polarized) | radial  | generic — (+) to sense node, (−) to SW_GND |
 
-### IRLZ44N Pinout (TO-220, facing label)
+### FQP30N06L Pinout (TO-220, facing label)
 
 ```
-    ┌─────────┐
-    │ IRLZ44N │
-    │         │
-    └─┬──┬──┬─┘
+    ┌──────────┐
+    │ FQP30N06L│
+    │          │
+    └─┬──┬──┬──┘
       │  │  │
       G  D  S
       │  │  │
@@ -290,9 +197,9 @@ Capacitor Polarity:
 
 ## Notes
 
-- **Why IRLZ44N is fine here**: Yes, it's a 47A/55V power MOSFET for a circuit drawing 50µA. But what matters is the guaranteed logic-level threshold (1–2V) — at 3.3V Vgs it's hard on with negligible Rds. Gate leakage is in the nanoamp range. The TO-220 package is physically large but electrically perfect.
-- **FQP30N06L is interchangeable**: Same pinout (G-D-S facing label), same logic-level threshold. Use whichever you grab first.
+- **Why FQP30N06L is fine here**: Yes, it's a 30A/60V power MOSFET for a circuit drawing 50µA. But what matters is the guaranteed logic-level threshold (1–2V) — at 3.3V Vgs it's hard on with negligible Rds (35mΩ). Gate leakage is in the nanoamp range. The TO-220 package is physically large but electrically perfect.
+- **IRLZ44N is interchangeable**: Same pinout (G-D-S facing label), same logic-level threshold. Use whichever you grab first.
 - **ADC calibration**: The ESP32-S3 ADC has per-chip variation. For more accurate readings, use `esp_adc_cal` APIs with eFuse calibration data, or calibrate with a known reference voltage.
 - **Protection**: If there's risk of voltages exceeding 7V on the solar input (e.g., during load dump), add a 3.3V Zener diode from each ADC pin to GND as overvoltage protection.
 - **Measurement frequency**: A reading every 30–60 seconds during active mode is plenty. Each measurement takes <10ms total.
-- **NiMH discharge curve**: NiMH has a very flat discharge curve — voltage alone isn't a great SoC indicator. Consider tracking coulombs or using a lookup table calibrated to your specific cells.
+- **NiMH discharge curve**: NiMH AA cells have a very flat discharge curve (~1.2V for most of their capacity). Voltage-based SoC is inherently imprecise for NiMH — expect ±20% accuracy. The linear approximation (3.0V empty → 4.2V full) is acceptable for a "battery low" warning but not for precise capacity tracking.
