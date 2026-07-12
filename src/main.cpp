@@ -354,6 +354,9 @@ void handlePostConfig() {
 }
 
 void handleGetStatus() {
+    // Take a fresh voltage reading so /status always returns current values
+    readPowerMonitor();
+
     struct tm timeinfo;
     String timeStr = "unknown";
     String sunriseStr = "—";
