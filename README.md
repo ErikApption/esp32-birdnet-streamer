@@ -1,14 +1,19 @@
 # ESP32 BirdNet Streamer
 
-ESP32-S3 project that captures audio from an I2S MEMS microphone and streams raw PCM data over UDP for BirdNET processing. Includes WiFi captive-portal configuration, sunrise/sunset scheduling with deep sleep, and OTA firmware updates.
+ESP32-S3 project that captures audio from an I2S MEMS microphone and streams Opus-encoded audio over UDP for BirdNET processing. Includes a Python listener that receives the UDP stream and re-serves it as an HTTP Ogg/Opus stream for playback in VLC or other media players.
+
+**Design priority: battery life over latency.** The ESP32 accumulates ~1 second of encoded audio and sends it in a single burst, allowing the WiFi radio to sleep between transmissions. The listener absorbs this burstiness with a playout buffer and delivers smooth, paced audio to HTTP clients. This is not a real-time system — expect 2–5 seconds of latency between live audio and playback.
 
 ## Features
 
-- **I2S microphone input** — 16-bit mono at 16 kHz, streamed as raw PCM over UDP
+- **I2S microphone input** — 48 kHz, 16-bit mono from INMP441 MEMS microphone
+- **Opus encoding** — 64 kbps, 60ms frames, hardware-accelerated on ESP32-S3
+- **Burst UDP transmission** — 1-second bursts maximize WiFi radio sleep for battery life
 - **WiFi configuration** — captive portal (WiFiManager) for zero-code network setup
 - **OTA updates** — push new firmware over the network without a USB cable
 - **Sleep schedule** — active from 1 hour before sunrise until sunset, deep sleep overnight
-- **Configurable location** — latitude, longitude, and UTC offset set via the portal
+- **Power monitoring** — battery and solar voltage telemetry embedded in audio packets
+- **Python listener** — UDP receiver → HTTP Ogg/Opus stream with paced delivery for VLC
 
 ## Hardware
 
@@ -326,15 +331,101 @@ Available parameters: `udp_host`, `udp_port`, `sample_rate`, `latitude`, `longit
 
 Allowed sample rates: `8000`, `16000`, `22050`, `32000`, `44100`, `48000` Hz. Changing the sample rate requires an I2S driver reinit, so the board reboots automatically.
 
-## UDP Audio Format
+## UDP Audio Protocol
 
-| Parameter   | Value                                                                    |
-| ----------- | ------------------------------------------------------------------------ |
-| Encoding    | Raw PCM (little-endian)                                                  |
-| Sample rate | Configurable: 8000, 16000, 22050, 32000, 44100, 48000 Hz (default 48000) |
-| Bit depth   | 16-bit signed                                                            |
-| Channels    | 1 (mono)                                                                 |
-| Packet size | ≤ 1024 bytes                                                             |
+The ESP32 sends Opus-encoded audio in a custom lightweight framing format designed for low-overhead UDP transport.
+
+### Packet Format
+
+```
+[Header: 4 bytes][Frame 1][Frame 2]...[Frame N][Optional Telemetry Trailer: 22 bytes]
+
+Header:
+  Byte 0-1: Magic "OP" (0x4F 0x50)
+  Byte 2:   Frame count (number of Opus frames in this packet)
+  Byte 3:   Sequence number (0-255, wrapping)
+
+Each Frame:
+  2 bytes:  Frame length (big-endian)
+  N bytes:  Opus-encoded audio data
+
+Telemetry Trailer (optional, appended to last packet in burst):
+  Byte 0-1: Magic "TL" (0x54 0x4C)
+  Byte 2-3: Battery ADC mV (big-endian)
+  Byte 4-5: Solar ADC mV (big-endian)
+  Byte 6-7: WiFi RSSI int16 (big-endian)
+  Byte 8-11: Total packets sent (big-endian)
+  Byte 12-15: Total send errors (big-endian)
+  Byte 16-19: Total packets dropped (big-endian)
+  Byte 20:  WiFi connected (1/0)
+  Byte 21:  Consecutive send failures (capped at 255)
+```
+
+### Encoding Parameters
+
+| Parameter        | Value                          |
+| ---------------- | ------------------------------ |
+| Codec            | Opus (OPUS_APPLICATION_AUDIO)  |
+| Sample rate      | 48000 Hz                       |
+| Channels         | 1 (mono)                       |
+| Frame duration   | 60 ms                          |
+| Bitrate          | 64 kbps                        |
+| Frames per packet| 4 (240 ms of audio per packet) |
+| Burst interval   | 1000 ms                        |
+| DTX              | Enabled (saves bandwidth in silence) |
+
+### Streaming Architecture
+
+```
+┌─────────────┐   UDP bursts    ┌────────────────┐   HTTP (paced)   ┌─────┐
+│   ESP32-S3  │ ──── ~1s ────→  │ Python Listener│ ──── smooth ──→  │ VLC │
+│  (battery)  │   4 packets/s   │  (always-on)   │   60ms/frame     │     │
+└─────────────┘                  └────────────────┘                  └─────┘
+      │                                  │
+      │ Sleeps radio between             │ Absorbs bursts into
+      │ bursts (~750ms/s idle)           │ playout buffer, meters
+      │                                  │ frames out at real-time
+      └──── Battery life priority        └──── Smooth playback for VLC
+```
+
+The listener's `/stream.opus` endpoint delivers Ogg/Opus at real-time rate regardless of how the data arrived from UDP. This decouples the ESP32's power-saving burst strategy from the playback client's timing requirements.
+
+## Listener
+
+The Python listener (`listener/`) receives UDP audio from the ESP32 and serves it as an HTTP Ogg/Opus stream.
+
+### Quick Start
+
+```bash
+cd listener
+poetry install
+poetry run birdnet-listener
+```
+
+### Endpoints
+
+| Endpoint       | Format    | Description                                      |
+| -------------- | --------- | ------------------------------------------------ |
+| `/stream.opus` | Ogg/Opus  | **Primary.** Paced delivery, works with VLC.     |
+| `/stream.m3u`  | M3U       | Playlist pointing to `/stream.opus`              |
+| `/stream`      | WAV/PCM   | Legacy. No pacing — may buffer in VLC.           |
+| `/`            | JSON      | Status and diagnostics                           |
+
+### VLC Playback
+
+Open the playlist URL in VLC:
+
+```bash
+vlc http://localhost:8086/stream.m3u
+```
+
+Or directly:
+
+```bash
+vlc http://localhost:8086/stream.opus --network-caching=5000
+```
+
+The `--network-caching=5000` flag gives VLC a 5-second buffer to absorb any residual jitter. With the listener's paced delivery this usually isn't needed, but it provides extra margin.
 
 ## License
 

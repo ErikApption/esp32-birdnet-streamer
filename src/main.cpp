@@ -45,7 +45,9 @@
 #define OPUS_FRAMES_PER_PACKET 4    // Bundle 4 frames per UDP packet (240ms per packet)
 
 // ─── Burst Transmission Configuration ────────────────────────────────────────
-// Buffer encoded packets and send them in bursts to let WiFi radio sleep between
+// Buffer encoded packets and send them in bursts to let WiFi radio sleep between.
+// Longer intervals = more radio sleep = better battery life. The listener side
+// handles buffering to smooth out bursty delivery for playback clients.
 #define BURST_INTERVAL_MS     1000  // Accumulate for 1 second, then burst-send
 #define BURST_MAX_PACKETS     8     // Max packets to buffer (8 × 240ms = 1.92s headroom)
 

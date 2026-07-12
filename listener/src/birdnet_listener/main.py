@@ -73,7 +73,7 @@ def create_app(
 ) -> FastAPI:
     app = FastAPI(title="BirdNet Listener")
     audio_buffer = StreamBuffer()
-    opus_buffer = StreamBuffer(max_chunks=500)
+    opus_buffer = StreamBuffer(max_chunks=800)
     udp_protocol: UDPReceiverProtocol | None = None
 
     @app.on_event("startup")
@@ -153,10 +153,10 @@ def create_app(
 
     @app.get("/stream.m3u")
     async def playlist(request: Request):
-        """Serve an M3U playlist pointing to the audio stream."""
+        """Serve an M3U playlist pointing to the Opus audio stream."""
         host = request.headers.get("host", f"localhost:{http_port}")
         scheme = request.url.scheme
-        stream_url = f"{scheme}://{host}/stream"
+        stream_url = f"{scheme}://{host}/stream.opus"
 
         m3u_content = f"#EXTM3U\n#EXTINF:-1,BirdNet Live Stream\n{stream_url}\n"
         return PlainTextResponse(
@@ -169,17 +169,14 @@ def create_app(
     async def stream(request: Request):
         """Stream live audio as WAV (PCM 16-bit).
 
-        Paces output at real-time audio rate to prevent VLC clock drift.
-        Each PCM chunk corresponds to one decoded Opus frame (60ms at 48kHz).
+        Note: The Opus stream (/stream.opus) is the preferred endpoint.
+        This WAV stream decodes on the listener and has no pacing, so VLC
+        may struggle with bursty delivery. Use --network-caching=5000 in VLC.
         """
         wav_header = make_wav_header(sample_rate, channels=channels)
-        frame_duration_s = 60.0 / 1000.0  # 60ms per decoded Opus frame
 
         async def audio_generator() -> AsyncGenerator[bytes, None]:
             yield wav_header
-            frames_sent = 0
-            initial_burst_frames = int(2.0 / frame_duration_s)  # ~33 frames
-
             async for chunk in audio_buffer.stream_from():
                 if await request.is_disconnected():
                     break
@@ -191,10 +188,6 @@ def create_app(
                 if normalizer is not None:
                     processed = normalizer.normalize(processed)
                 yield processed
-
-                frames_sent += 1
-                if frames_sent > initial_burst_frames:
-                    await asyncio.sleep(frame_duration_s * 0.9)
 
         return StreamingResponse(
             audio_generator(),
@@ -208,60 +201,118 @@ def create_app(
 
     @app.get("/stream.opus")
     async def stream_opus(request: Request):
-        """Stream live audio as Ogg/Opus (passthrough, no decoding/re-encoding).
+        """Stream live audio as Ogg/Opus with paced delivery.
 
-        Frames are paced at real-time rate to prevent VLC clock issues.
-        The ESP32 sends audio in ~1-second bursts, but VLC expects data to
-        arrive at a steady rate. Without pacing, VLC sees the bursty arrival
-        pattern and reports "buffer too late" / "PCR is called too late" errors,
-        causing playback to stutter and repeatedly rebuffer.
+        The ESP32 sends audio in ~1-second bursts to maximize battery life
+        (longer WiFi radio sleep between transmissions). This endpoint absorbs
+        that burstiness with a playout buffer: frames are accumulated as they
+        arrive from UDP and metered out to HTTP clients at real-time rate.
 
-        The pacing strategy: accumulate burst frames immediately, then yield
-        them to the client at the audio's natural rate (one frame per
-        OPUS_FRAME_MS). This transforms bursty network delivery into smooth
-        playback-rate delivery that VLC's clock can track.
+        Strategy:
+        1. On connect, dump any pre-buffered frames immediately so VLC can
+           fill its internal buffer and start playback quickly.
+        2. After the initial burst, deliver frames at audio real-time rate
+           (~60ms per frame) regardless of when they actually arrived from UDP.
+        3. If the playout buffer runs dry (network stall), wait for more data
+           and resume delivery without a clock reset.
         """
-        # Frame duration in seconds (60ms for this encoder)
-        frame_duration_s = 60.0 / 1000.0  # OPUS_FRAME_MS / 1000
+        # Frame duration at 48kHz with 60ms Opus frames
+        frame_duration_s = 60.0 / 1000.0
 
         async def opus_generator() -> AsyncGenerator[bytes, None]:
             ogg_stream = OggOpusStream(sample_rate=sample_rate, channels=channels)
             yield ogg_stream.get_headers()
 
-            # For the initial burst, send frames immediately to fill VLC's
-            # buffer quickly. After that, pace delivery at real-time rate.
-            frames_sent = 0
-            # Let the first ~2 seconds through unthrottled so VLC's initial
-            # buffering phase completes quickly.
-            initial_burst_frames = int(2.0 / frame_duration_s)  # ~33 frames
+            # Pre-buffer: send recent Opus frames immediately so VLC can fill
+            # its playback buffer without waiting. These have proper granule
+            # positions so VLC interprets them correctly.
+            buffered_frames = list(opus_buffer._buffer)
+            if buffered_frames:
+                page_data = ogg_stream.write_opus_frames(buffered_frames)
+                if page_data:
+                    yield page_data
+
+            # Paced delivery: meter frames out at real-time rate.
+            # We use a local queue that accumulates from the opus_buffer
+            # and drains at frame_duration_s intervals.
+            frame_queue: asyncio.Queue[bytes | None] = asyncio.Queue()
+
+            async def feeder():
+                """Pull frames from opus_buffer into the local queue."""
+                try:
+                    async for opus_frame in opus_buffer.stream_from():
+                        await frame_queue.put(opus_frame)
+                except Exception:
+                    pass
+                finally:
+                    await frame_queue.put(None)  # sentinel
+
+            feeder_task = asyncio.create_task(feeder())
 
             try:
-                async for opus_frame in opus_buffer.stream_from():
+                while True:
                     if await request.is_disconnected():
                         logger.debug("[Opus] Client disconnected, closing stream")
                         break
 
-                    page_data = ogg_stream.write_opus_frame(opus_frame)
+                    # Wait for a frame (blocks until one is available)
+                    frame = await frame_queue.get()
+                    if frame is None:
+                        break
+
+                    page_data = ogg_stream.write_opus_frame(frame, flush=False)
                     if page_data:
                         yield page_data
 
-                    frames_sent += 1
+                    # Batch up to flush_interval frames if more are ready,
+                    # then flush as a single Ogg page and pace.
+                    frames_in_page = 1
+                    flush_interval = 4  # 4 frames = 240ms per Ogg page
+                    done = False
 
-                    # After initial burst, pace at real-time to keep VLC happy
-                    if frames_sent > initial_burst_frames:
-                        await asyncio.sleep(frame_duration_s * 0.9)
+                    while frames_in_page < flush_interval and not frame_queue.empty():
+                        frame = frame_queue.get_nowait()
+                        if frame is None:
+                            done = True
+                            break
+                        page_data = ogg_stream.write_opus_frame(frame, flush=False)
+                        if page_data:
+                            yield page_data
+                        frames_in_page += 1
+
+                    # Flush accumulated frames as one Ogg page
+                    page_data = ogg_stream.flush()
+                    if page_data:
+                        yield page_data
+
+                    if done:
+                        break
+
+                    # Pace: sleep for the real-time duration of the frames we just sent.
+                    # Use 95% of real-time so we drain slightly faster than production
+                    # rate, preventing unbounded queue growth while keeping delivery smooth.
+                    await asyncio.sleep(frame_duration_s * frames_in_page * 0.95)
+
             finally:
+                feeder_task.cancel()
+                try:
+                    await feeder_task
+                except asyncio.CancelledError:
+                    pass
                 closing_data = ogg_stream.close()
                 if closing_data:
                     yield closing_data
 
         return StreamingResponse(
             opus_generator(),
-            media_type="audio/ogg",
+            media_type="audio/ogg; codecs=opus",
             headers={
                 "Cache-Control": "no-cache, no-store",
                 "Connection": "keep-alive",
                 "X-Content-Type-Options": "nosniff",
+                "Icy-Name": "BirdNet Live",
+                "Icy-Genre": "Nature",
+                "Icy-Pub": "0",
             },
         )
 

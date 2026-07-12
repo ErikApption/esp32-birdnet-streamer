@@ -147,6 +147,14 @@ class OggOpusStream:
             )
         return self._flush_pages()
 
+    def flush(self) -> bytes:
+        """Force-flush any buffered packets into Ogg pages.
+
+        Call this periodically when using write_opus_frame(flush=False) to
+        emit accumulated frames as a page.
+        """
+        return self._flush_pages()
+
     def close(self) -> bytes:
         """Clean up the Ogg stream state and return any final pages."""
         output = self._flush_pages()
