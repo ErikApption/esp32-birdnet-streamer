@@ -305,14 +305,11 @@ def create_app(
 
         return StreamingResponse(
             opus_generator(),
-            media_type="audio/ogg; codecs=opus",
+            media_type="audio/ogg",
             headers={
                 "Cache-Control": "no-cache, no-store",
                 "Connection": "keep-alive",
                 "X-Content-Type-Options": "nosniff",
-                "Icy-Name": "BirdNet Live",
-                "Icy-Genre": "Nature",
-                "Icy-Pub": "0",
             },
         )
 
