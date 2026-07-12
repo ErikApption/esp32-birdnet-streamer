@@ -196,7 +196,12 @@ def create_app(
 
     @app.get("/stream.opus")
     async def stream_opus(request: Request):
-        """Stream live audio as Ogg/Opus (passthrough, no decoding/re-encoding)."""
+        """Stream live audio as Ogg/Opus (passthrough, no decoding/re-encoding).
+
+        Frames are flushed individually per Ogg page for low-latency delivery.
+        The OggOpusStream handles proper granule position accounting (including
+        pre-skip) so VLC can establish a correct PCR reference.
+        """
 
         async def opus_generator() -> AsyncGenerator[bytes, None]:
             ogg_stream = OggOpusStream(sample_rate=sample_rate, channels=channels)

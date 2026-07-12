@@ -87,8 +87,7 @@ class UDPReceiverProtocol(asyncio.DatagramProtocol):
     PACKET_MAGIC = b"OP"
     TELEMETRY_MAGIC = b"TL"
     HEADER_SIZE = 4  # 2 bytes magic + 1 byte frame_count + 1 byte sequence_number
-    TELEMETRY_SIZE = 6  # 2 magic + 2 bat_adc_mV + 2 sol_adc_mV (minimum, backward-compat)
-    TELEMETRY_EXTENDED_SIZE = 22  # 6 base + 2 rssi + 4 sent + 4 errors + 4 dropped + 1 wifi + 1 consec_fails
+    TELEMETRY_TRAILER_SIZE = 22  # 2 magic + 2 bat_adc_mV + 2 sol_adc_mV + 2 rssi + 4 sent + 4 errors + 4 dropped + 1 wifi + 1 consec_fails
     FRAME_SIZE = 2880  # 60ms at 48kHz mono (samples per frame)
     LARGE_GAP_THRESHOLD = 128  # gaps larger than this are treated as reordering
 
@@ -376,62 +375,12 @@ class UDPReceiverProtocol(asyncio.DatagramProtocol):
                 logger.warning(f"[UDP] Packet too short ({len(data)} bytes), need at least {self.HEADER_SIZE}")
             return
 
-        # ─── Handle telemetry packets ────────────────────────────────────
+        # ─── Handle telemetry packets (legacy: standalone TL packets) ─────
+        # Also handles telemetry trailers appended to audio packets (see below).
         if data[0:2] == self.TELEMETRY_MAGIC:
-            if len(data) >= self.TELEMETRY_SIZE:
-                # Raw ADC millivolts from ESP32
-                bat_adc_mv = int.from_bytes(data[2:4], "big")
-                sol_adc_mv = int.from_bytes(data[4:6], "big")
-
-                # Apply divider ratios to recover actual voltages
-                self.battery_voltage = (bat_adc_mv / 1000.0) * self.VBAT_DIVIDER_RATIO
-                self.solar_voltage = (sol_adc_mv / 1000.0) * self.VSOL_DIVIDER_RATIO
-
-                # Determine if charger is active — when solar is producing power,
-                # the charge module pushes its own voltage onto the battery terminals,
-                # making the reading unreliable for SoC estimation.
-                charging = (
-                    self.solar_voltage > self.VSOL_CHARGING_THRESHOLD
-                    or self.battery_voltage > self.VBAT_ABS_MAX
-                )
-                self.is_charging = charging
-
-                if charging:
-                    # Can't estimate SoC while charger is active — report -1
-                    self.battery_percent = -1
-                else:
-                    pct = (self.battery_voltage - self.VBAT_EMPTY) / (self.VBAT_FULL - self.VBAT_EMPTY) * 100.0
-                    self.battery_percent = int(max(0, min(100, pct)))
-
-                # ─── Parse extended UDP stats if present ──────────────────
-                if len(data) >= self.TELEMETRY_EXTENDED_SIZE:
-                    self.esp_rssi = int.from_bytes(data[6:8], "big", signed=True)
-                    self.esp_udp_sent = int.from_bytes(data[8:12], "big")
-                    self.esp_udp_errors = int.from_bytes(data[12:16], "big")
-                    self.esp_udp_dropped = int.from_bytes(data[16:20], "big")
-                    self.esp_wifi_connected = data[20] == 1
-                    self.esp_consecutive_fails = data[21]
-
-                self._telemetry_received += 1
-                if self._telemetry_received <= 3 or self._telemetry_received % 60 == 0:
-                    if charging:
-                        status = f"charging (bat sense: {self.battery_voltage:.2f}V — charger voltage, not true SoC)"
-                    else:
-                        status = f"{self.battery_voltage:.2f}V ({self.battery_percent}%)"
-                    log_msg = (
-                        f"[Telemetry] Battery: {status}, "
-                        f"Solar: {self.solar_voltage:.2f}V "
-                        f"(raw ADC: bat={bat_adc_mv}mV, sol={sol_adc_mv}mV)"
-                    )
-                    if len(data) >= self.TELEMETRY_EXTENDED_SIZE:
-                        log_msg += (
-                            f" | RSSI: {self.esp_rssi}dBm"
-                            f" | UDP: sent={self.esp_udp_sent} err={self.esp_udp_errors}"
-                            f" drop={self.esp_udp_dropped}"
-                        )
-                        if self.esp_consecutive_fails > 0:
-                            log_msg += f" (failing: {self.esp_consecutive_fails}x)"
-                    logger.info(log_msg)
+            # Legacy standalone telemetry packet — parse it for backward compat
+            if len(data) >= 6:
+                self._parse_telemetry_payload(data[2:])
             return
 
         if data[0:2] != self.PACKET_MAGIC:
@@ -690,6 +639,76 @@ class UDPReceiverProtocol(asyncio.DatagramProtocol):
                         logger.warning(f"[UDP] Opus decode error (frame {i+1}/{frame_count}): {e}")
                     elif self._decode_errors == 6:
                         logger.warning("[UDP] Suppressing further Opus decode errors")
+
+        # ─── Check for telemetry trailer after opus frames ────────────────
+        # The ESP32 appends a 22-byte telemetry trailer (starting with "TL" magic)
+        # to the last audio packet in each burst when telemetry data is fresh.
+        remaining = payload[offset:]
+        if len(remaining) >= self.TELEMETRY_TRAILER_SIZE and remaining[0:2] == self.TELEMETRY_MAGIC:
+            self._parse_telemetry_payload(remaining[2:])
+
+    def _parse_telemetry_payload(self, data: bytes) -> None:
+        """Parse telemetry payload bytes (after the 'TL' magic has been stripped).
+
+        Supports both the minimal 4-byte payload (bat + sol) and the full 20-byte
+        extended payload (bat + sol + rssi + sent + errors + dropped + wifi + consec).
+        """
+        if len(data) < 4:
+            return
+
+        # Raw ADC millivolts from ESP32
+        bat_adc_mv = int.from_bytes(data[0:2], "big")
+        sol_adc_mv = int.from_bytes(data[2:4], "big")
+
+        # Apply divider ratios to recover actual voltages
+        self.battery_voltage = (bat_adc_mv / 1000.0) * self.VBAT_DIVIDER_RATIO
+        self.solar_voltage = (sol_adc_mv / 1000.0) * self.VSOL_DIVIDER_RATIO
+
+        # Determine if charger is active — when solar is producing power,
+        # the charge module pushes its own voltage onto the battery terminals,
+        # making the reading unreliable for SoC estimation.
+        charging = (
+            self.solar_voltage > self.VSOL_CHARGING_THRESHOLD
+            or self.battery_voltage > self.VBAT_ABS_MAX
+        )
+        self.is_charging = charging
+
+        if charging:
+            # Can't estimate SoC while charger is active — report -1
+            self.battery_percent = -1
+        else:
+            pct = (self.battery_voltage - self.VBAT_EMPTY) / (self.VBAT_FULL - self.VBAT_EMPTY) * 100.0
+            self.battery_percent = int(max(0, min(100, pct)))
+
+        # ─── Parse extended UDP stats if present (20 bytes total payload) ─
+        if len(data) >= 20:
+            self.esp_rssi = int.from_bytes(data[4:6], "big", signed=True)
+            self.esp_udp_sent = int.from_bytes(data[6:10], "big")
+            self.esp_udp_errors = int.from_bytes(data[10:14], "big")
+            self.esp_udp_dropped = int.from_bytes(data[14:18], "big")
+            self.esp_wifi_connected = data[18] == 1
+            self.esp_consecutive_fails = data[19]
+
+        self._telemetry_received += 1
+        if self._telemetry_received <= 3 or self._telemetry_received % 60 == 0:
+            if charging:
+                status = f"charging (bat sense: {self.battery_voltage:.2f}V — charger voltage, not true SoC)"
+            else:
+                status = f"{self.battery_voltage:.2f}V ({self.battery_percent}%)"
+            log_msg = (
+                f"[Telemetry] Battery: {status}, "
+                f"Solar: {self.solar_voltage:.2f}V "
+                f"(raw ADC: bat={bat_adc_mv}mV, sol={sol_adc_mv}mV)"
+            )
+            if len(data) >= 20:
+                log_msg += (
+                    f" | RSSI: {self.esp_rssi}dBm"
+                    f" | UDP: sent={self.esp_udp_sent} err={self.esp_udp_errors}"
+                    f" drop={self.esp_udp_dropped}"
+                )
+                if self.esp_consecutive_fails > 0:
+                    log_msg += f" (failing: {self.esp_consecutive_fails}x)"
+            logger.info(log_msg)
 
     def _analyze_pcm_frame(self, pcm: bytes) -> None:
         """Analyze a decoded PCM frame for silence, quiet, or clipping."""

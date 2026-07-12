@@ -13,7 +13,9 @@
 #include <opus.h>
 
 // Onboard LED
+#ifndef RGB_BUILTIN
 #define RGB_BUILTIN 48
+#endif
 
 // ─── I2S Configuration ───────────────────────────────────────────────────────
 #define I2S_WS_PIN        5   // Word Select (LRCLK)
@@ -64,16 +66,18 @@
 #define ADC_SAMPLES       16
 #define POWER_READ_INTERVAL_MS  (60 * 1000)  // Read every 60 seconds
 
-// Telemetry packet: magic "TL" + battery_adc_mV (uint16) + solar_adc_mV (uint16) + UDP stats
+// Telemetry trailer: appended to audio packets (no separate telemetry socket needed)
+// Format: magic "TL" (2 bytes) + telemetry payload (20 bytes) = 22 bytes total
+// Attached to the last audio packet in each burst when telemetry data is fresh.
 #define TELEMETRY_MAGIC_0   0x54  // 'T'
 #define TELEMETRY_MAGIC_1   0x4C  // 'L'
-#define TELEMETRY_PACKET_SIZE 22  // 2 magic + 2 bat + 2 sol + 2 rssi + 4 sent + 4 errors + 4 dropped + 1 wifi + 1 consec_fails
+#define TELEMETRY_TRAILER_SIZE 22  // 2 magic + 2 bat + 2 sol + 2 rssi + 4 sent + 4 errors + 4 dropped + 1 wifi + 1 consec_fails
 
 // ─── HTTP Config Server ──────────────────────────────────────────────────────
 #define HTTP_PORT         80
 
 // ─── Globals ─────────────────────────────────────────────────────────────────
-WiFiUDP udp;
+WiFiUDP udp;          // Audio streaming — used exclusively by audioTask on core 1
 WebServer server(HTTP_PORT);
 Preferences prefs;
 
@@ -107,7 +111,13 @@ float lastBatteryVoltage = 0.0f;  // raw ADC voltage (before divider scaling)
 float lastSolarVoltage   = 0.0f;  // raw ADC voltage (before divider scaling)
 unsigned long lastPowerReadTime = 0;
 
-// ─── UDP Target (used by streaming and telemetry) ────────────────────────────
+// ─── Telemetry Trailer State ─────────────────────────────────────────────────
+// Telemetry is assembled in loop() on core 0, then attached to the next audio
+// burst by the audioTask on core 1. A volatile flag signals fresh data.
+volatile bool telemetryPending = false;
+uint8_t telemetryTrailer[TELEMETRY_TRAILER_SIZE];  // pre-built trailer bytes
+
+// ─── UDP Target (used by streaming) ──────────────────────────────────────────
 IPAddress resolvedUdpAddr;
 unsigned long lastResolveTime = 0;
 unsigned long udpSendErrors = 0;
@@ -144,7 +154,7 @@ int udpPacketOffset = 0;             // current write position in packet buffer
 int udpPacketFrameCount = 0;         // frames accumulated in current packet
 uint8_t udpSequenceNumber = 0;       // wrapping sequence counter for packet ordering
 #define UDP_PACKET_HEADER_SIZE 4     // magic(2) + frame_count(1) + seq(1)
-#define UDP_PACKET_BUF_SIZE 1400     // stay well under MTU (1500 - 20 IP - 8 UDP = 1472)
+#define UDP_PACKET_BUF_SIZE 1400     // stay well under MTU (1500-20-8=1472; +22 trailer = max 1422)
 
 // ─── Burst Buffer (ring of completed packets awaiting transmission) ──────────
 struct BurstPacket {
@@ -563,7 +573,7 @@ void readPowerMonitor() {
     if (!diagnosticMode) {
         digitalWrite(MONITOR_EN_PIN, HIGH);
     }
-    delay(2);  // RC settling time
+    delayMicroseconds(2000);  // RC settling — use microseconds to avoid triggering RTOS tick
 
     float vBatAdc = readAdcVoltage(VBAT_ADC_PIN);
     float vSolAdc = readAdcVoltage(VSOL_ADC_PIN);
@@ -584,8 +594,7 @@ void readPowerMonitor() {
 void sendTelemetryPacket() {
     if (resolvedUdpAddr == IPAddress(0, 0, 0, 0)) return;
 
-    uint16_t port = (uint16_t)atoi(udpPort);
-    // Send raw ADC millivolts (before divider scaling)
+    // Build telemetry trailer bytes (will be appended to the next audio burst packet)
     uint16_t batMv = (uint16_t)(lastBatteryVoltage * 1000.0f);
     uint16_t solMv = (uint16_t)(lastSolarVoltage * 1000.0f);
     int16_t rssi = (int16_t)WiFi.RSSI();
@@ -595,34 +604,31 @@ void sendTelemetryPacket() {
     uint8_t wifiStatus = (WiFi.status() == WL_CONNECTED) ? 1 : 0;
     uint8_t consecFails = (uint8_t)min(udpConsecutiveFails, (unsigned long)255);
 
-    uint8_t pkt[TELEMETRY_PACKET_SIZE];
-    pkt[0] = TELEMETRY_MAGIC_0;       // 'T'
-    pkt[1] = TELEMETRY_MAGIC_1;       // 'L'
-    pkt[2] = (uint8_t)(batMv >> 8);   // battery ADC mV big-endian
-    pkt[3] = (uint8_t)(batMv & 0xFF);
-    pkt[4] = (uint8_t)(solMv >> 8);   // solar ADC mV big-endian
-    pkt[5] = (uint8_t)(solMv & 0xFF);
-    // ─── Extended fields (UDP stats) ────────────────────────────────────
-    pkt[6] = (uint8_t)(rssi >> 8);    // RSSI int16 big-endian
-    pkt[7] = (uint8_t)(rssi & 0xFF);
-    pkt[8]  = (uint8_t)(sent >> 24);  // UDP sent uint32 big-endian
-    pkt[9]  = (uint8_t)(sent >> 16);
-    pkt[10] = (uint8_t)(sent >> 8);
-    pkt[11] = (uint8_t)(sent & 0xFF);
-    pkt[12] = (uint8_t)(errors >> 24); // UDP errors uint32 big-endian
-    pkt[13] = (uint8_t)(errors >> 16);
-    pkt[14] = (uint8_t)(errors >> 8);
-    pkt[15] = (uint8_t)(errors & 0xFF);
-    pkt[16] = (uint8_t)(dropped >> 24); // UDP dropped uint32 big-endian
-    pkt[17] = (uint8_t)(dropped >> 16);
-    pkt[18] = (uint8_t)(dropped >> 8);
-    pkt[19] = (uint8_t)(dropped & 0xFF);
-    pkt[20] = wifiStatus;              // 1=connected, 0=disconnected
-    pkt[21] = consecFails;             // consecutive send failures (capped 255)
+    telemetryTrailer[0] = TELEMETRY_MAGIC_0;       // 'T'
+    telemetryTrailer[1] = TELEMETRY_MAGIC_1;       // 'L'
+    telemetryTrailer[2] = (uint8_t)(batMv >> 8);   // battery ADC mV big-endian
+    telemetryTrailer[3] = (uint8_t)(batMv & 0xFF);
+    telemetryTrailer[4] = (uint8_t)(solMv >> 8);   // solar ADC mV big-endian
+    telemetryTrailer[5] = (uint8_t)(solMv & 0xFF);
+    telemetryTrailer[6] = (uint8_t)(rssi >> 8);    // RSSI int16 big-endian
+    telemetryTrailer[7] = (uint8_t)(rssi & 0xFF);
+    telemetryTrailer[8]  = (uint8_t)(sent >> 24);  // UDP sent uint32 big-endian
+    telemetryTrailer[9]  = (uint8_t)(sent >> 16);
+    telemetryTrailer[10] = (uint8_t)(sent >> 8);
+    telemetryTrailer[11] = (uint8_t)(sent & 0xFF);
+    telemetryTrailer[12] = (uint8_t)(errors >> 24); // UDP errors uint32 big-endian
+    telemetryTrailer[13] = (uint8_t)(errors >> 16);
+    telemetryTrailer[14] = (uint8_t)(errors >> 8);
+    telemetryTrailer[15] = (uint8_t)(errors & 0xFF);
+    telemetryTrailer[16] = (uint8_t)(dropped >> 24); // UDP dropped uint32 big-endian
+    telemetryTrailer[17] = (uint8_t)(dropped >> 16);
+    telemetryTrailer[18] = (uint8_t)(dropped >> 8);
+    telemetryTrailer[19] = (uint8_t)(dropped & 0xFF);
+    telemetryTrailer[20] = wifiStatus;              // 1=connected, 0=disconnected
+    telemetryTrailer[21] = consecFails;             // consecutive send failures (capped 255)
 
-    udp.beginPacket(resolvedUdpAddr, port);
-    udp.write(pkt, TELEMETRY_PACKET_SIZE);
-    udp.endPacket();
+    // Signal the audio task to attach this trailer to the next burst
+    telemetryPending = true;
 }
 
 // ─── Diagnostic Mode Endpoints ───────────────────────────────────────────────
@@ -642,7 +648,7 @@ void handleDiagStop() {
     // Restore voltage monitor pin to LOW (normal idle state)
     digitalWrite(MONITOR_EN_PIN, LOW);
     // Turn off the LED to save power
-    neopixelWrite(RGB_BUILTIN, 0, 0, 0);
+    rgbLedWrite(RGB_BUILTIN, 0, 0, 0);
     Serial.println("[Diag] Diagnostic mode STOPPED — MONITOR_EN_PIN LOW, LED off");
     server.send(200, "application/json", "{\"diagnostic\":\"stopped\",\"monitor_pin\":\"LOW\",\"led\":\"disabled\"}");
 }
@@ -709,9 +715,9 @@ void updateSignalLed() {
 
     // Apply LED color based on latched state
     switch (latchedState) {
-        case 2:  neopixelWrite(RGB_BUILTIN, 20, 0, 0);   break;  // Red
-        case 1:  neopixelWrite(RGB_BUILTIN, 20, 15, 0);  break;  // Yellow
-        default: neopixelWrite(RGB_BUILTIN, 0, 20, 0);   break;  // Green
+        case 2:  rgbLedWrite(RGB_BUILTIN, 20, 0, 0);   break;  // Red
+        case 1:  rgbLedWrite(RGB_BUILTIN, 20, 15, 0);  break;  // Yellow
+        default: rgbLedWrite(RGB_BUILTIN, 0, 20, 0);   break;  // Green
     }
 
     // Reset counters for the next window
@@ -1261,13 +1267,14 @@ void enterDeepSleep(uint64_t sleepSeconds) {
 #define RESOLVE_INTERVAL_MS  (60 * 1000)  // re-resolve every 60s
 
 void udpInit() {
-    // Bind the UDP socket to a local port (0 = system picks an ephemeral port).
+    // Bind the audio UDP socket to a local port (0 = system picks an ephemeral port).
     // This MUST be called before beginPacket/endPacket or sends will fail with ENOMEM.
     if (udp.begin(0)) {
-        Serial.println("[UDP] Socket bound successfully");
+        Serial.println("[UDP] Audio socket bound successfully");
     } else {
-        Serial.println("[UDP] ERROR: Failed to bind socket!");
+        Serial.println("[UDP] ERROR: Failed to bind audio socket!");
     }
+
     Serial.printf("[UDP] Target: %s:%s\n", udpHost, udpPort);
     Serial.printf("[UDP] Retry: %d attempts, %dms delay | Backoff: %d-%dms\n",
         UDP_RETRY_ATTEMPTS, UDP_RETRY_DELAY_MS, UDP_BACKOFF_BASE_MS, UDP_BACKOFF_MAX_MS);
@@ -1302,7 +1309,7 @@ void streamAudio() {
     // Signal quality checks — only run in diagnostic mode to avoid
     // wasting CPU cycles during normal streaming operation.
     if (diagnosticMode) {
-        i2sFramesTotal++;
+        i2sFramesTotal = i2sFramesTotal + 1;
         
         // Check raw 32-bit amplitude — real mic signal produces large magnitudes.
         // A properly connected INMP441 drives the bus on most samples, not just a few.
@@ -1321,7 +1328,7 @@ void streamAudio() {
         // that pass a 5% threshold but fail at 10%.
         if (activeCount <= samplesRead32 / 10) {
             // Mic not driving bus (unpowered, SD shorted to GND, intermittent, etc.)
-            i2sFramesEmpty++;
+            i2sFramesEmpty = i2sFramesEmpty + 1;
         } else {
             // Bus appears driven — perform structural checks on the 16-bit audio.
             // These detect hardware faults (stuck lines, shorted pins) without
@@ -1381,7 +1388,7 @@ void streamAudio() {
             bool uncorrelatedNoise = (autoSum > 0 && crossSum * 10 < autoSum * 3);
             
             if (stuckLine || badDcBias || totallyFlat || uncorrelatedNoise) {
-                i2sFramesEmpty++;
+                i2sFramesEmpty = i2sFramesEmpty + 1;
             }
         }
     }
@@ -1432,9 +1439,9 @@ void streamAudio() {
             // Track Opus output size for diagnostic LED — very small frames
             // indicate the encoder received silence/blank input
             if (diagnosticMode) {
-                opusFramesEncoded++;
+                opusFramesEncoded = opusFramesEncoded + 1;
                 if (encodedBytes <= OPUS_SILENT_THRESHOLD) {
-                    opusFramesSilent++;
+                    opusFramesSilent = opusFramesSilent + 1;
                 }
             }
 
@@ -1521,6 +1528,7 @@ void logUdpStats() {
 }
 
 // Burst-send all queued packets at once — minimizes WiFi radio active time
+// If telemetry is pending, it's appended as a trailer to the last packet in the burst.
 void burstSendPackets() {
     if (burstReadIdx == burstWriteIdx) return;  // nothing queued
 
@@ -1553,8 +1561,19 @@ void burstSendPackets() {
     int packetsSent = 0;
     int packetsFailed = 0;
 
+    // Determine how many packets are queued so we can identify the last one
+    int queuedCount = (burstWriteIdx - burstReadIdx + BURST_MAX_PACKETS) % BURST_MAX_PACKETS;
+    int packetIndex = 0;
+
+    // Consume the telemetry flag atomically — only attach once per pending cycle
+    bool attachTelemetry = telemetryPending;
+    if (attachTelemetry) {
+        telemetryPending = false;
+    }
+
     while (burstReadIdx != burstWriteIdx) {
         BurstPacket &pkt = burstBuffer[burstReadIdx];
+        bool isLastPacket = (packetIndex == queuedCount - 1);
         bool sent = false;
 
         // Retry loop for each packet
@@ -1567,6 +1586,12 @@ void burstSendPackets() {
                 break;  // All retries exhausted for beginPacket
             }
             udp.write(pkt.data, pkt.length);
+
+            // Append telemetry trailer to the last packet in the burst
+            if (isLastPacket && attachTelemetry) {
+                udp.write(telemetryTrailer, TELEMETRY_TRAILER_SIZE);
+            }
+
             if (udp.endPacket()) {
                 sent = true;
                 break;
@@ -1597,10 +1622,19 @@ void burstSendPackets() {
             }
 
             // Stop this burst on failure — remaining packets stay queued
+            // If telemetry wasn't sent yet, re-flag it for the next burst
+            if (isLastPacket && attachTelemetry) {
+                telemetryPending = true;
+            } else if (attachTelemetry && !isLastPacket) {
+                // We failed mid-burst; telemetry was intended for last packet.
+                // Re-flag so next burst attempt will attach it.
+                telemetryPending = true;
+            }
             break;
         }
 
         burstReadIdx = (burstReadIdx + 1) % BURST_MAX_PACKETS;
+        packetIndex++;
         yield();  // Let lwIP process between packets in the burst
     }
 
@@ -1710,7 +1744,7 @@ void setup() {
     delay(1000);
 
     // Turn off the onboard RGB LED immediately — it may retain state across resets
-    neopixelWrite(RGB_BUILTIN, 0, 0, 0);
+    rgbLedWrite(RGB_BUILTIN, 0, 0, 0);
 
     Serial.println("\n══════════════════════════════════════════════════");
     Serial.println("       ESP32 BirdNet Streamer — Booting");

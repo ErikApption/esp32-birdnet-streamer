@@ -4,6 +4,16 @@ Ogg/Opus stream writer using PyOgg's libogg ctypes bindings.
 Wraps pre-encoded Opus frames into a valid Ogg/Opus byte stream suitable
 for HTTP streaming. Uses the reference libogg implementation (via PyOgg)
 for page framing, CRC, and lacing.
+
+Timestamp handling (RFC 7845):
+  The granule position in Ogg/Opus represents the number of PCM samples at
+  48kHz that have been encoded, INCLUDING the pre-skip. The first audio page
+  must have granule_pos >= pre_skip so that decoders can subtract pre-skip to
+  determine the actual playback position.
+
+  For live streaming to VLC, we start granule at pre_skip and increment by
+  frame_duration_samples for each frame. This ensures VLC's PCR tracking sees
+  a clean, monotonic timeline starting at time=0 (after pre-skip subtraction).
 """
 
 import ctypes
@@ -51,7 +61,11 @@ class OggOpusStream:
         self._ogg_packet = ogg.ogg_packet()
         self._ogg_page = ogg.ogg_page()
         self._packet_no = 0
-        self._granule_pos = 0
+        # Per RFC 7845: granule position represents total samples INCLUDING
+        # pre-skip. Start at pre_skip so the first audio frame's granule is
+        # pre_skip + frame_duration, which decoders interpret as playback
+        # position = frame_duration (i.e., time 0 + one frame of audio).
+        self._granule_pos = self.pre_skip
 
     def get_headers(self) -> bytes:
         """
@@ -108,6 +122,30 @@ class OggOpusStream:
         if flush:
             return self._flush_pages()
         return self._get_pages()
+
+    def write_opus_frames(self, opus_frames: list[bytes]) -> bytes:
+        """
+        Wrap multiple Opus frames into Ogg pages, flushing once at the end.
+
+        This is more efficient for bursty delivery (ESP32 sends frames in
+        bursts) — groups frames into fewer Ogg pages, reducing per-frame
+        overhead and giving VLC a single timestamp per burst.
+
+        Args:
+            opus_frames: List of raw Opus-encoded frame bytes.
+
+        Returns:
+            Ogg page bytes containing all the submitted frames.
+        """
+        for frame in opus_frames:
+            self._granule_pos += self.frame_duration_samples
+            self._write_packet_data(
+                frame,
+                granule_pos=self._granule_pos,
+                bos=False,
+                eos=False,
+            )
+        return self._flush_pages()
 
     def close(self) -> bytes:
         """Clean up the Ogg stream state and return any final pages."""
