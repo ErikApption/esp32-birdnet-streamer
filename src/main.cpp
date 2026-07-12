@@ -37,6 +37,7 @@
 #define UDP_BACKOFF_BASE_MS    50     // Base backoff after burst failure
 #define UDP_BACKOFF_MAX_MS     5000   // Maximum backoff duration
 #define UDP_STATS_INTERVAL_MS  (30 * 1000)  // Log UDP stats every 30s
+#define UDP_REBOOT_THRESHOLD   100    // Reboot after this many consecutive send failures
 
 // ─── Opus Encoder Configuration ─────────────────────────────────────────────
 #define OPUS_FRAME_MS         60    // 60ms frames — maximum efficiency, fewer packets
@@ -1692,6 +1693,14 @@ void burstSendPackets() {
             } else {
                 Serial.printf("[UDP] Re-resolved: %s -> %s\n", udpHost, resolvedUdpAddr.toString().c_str());
             }
+        }
+
+        // Too many consecutive failures — reboot to recover
+        if (udpConsecutiveFails >= UDP_REBOOT_THRESHOLD) {
+            Serial.printf("[UDP] %lu consecutive failures — rebooting to recover\n", udpConsecutiveFails);
+            Serial.flush();
+            delay(500);
+            ESP.restart();
         }
     } else if (packetsSent > 0) {
         // Success — reset backoff state
