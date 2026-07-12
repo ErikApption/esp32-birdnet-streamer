@@ -88,6 +88,16 @@ char longitude[12]  = DEFAULT_LONGITUDE;
 char utcOffset[4]   = DEFAULT_UTC_OFFSET;
 bool sleepEnabled   = false;
 
+// ─── Debug Mode ──────────────────────────────────────────────────────────────
+// Define FORCE_DEBUG_MODE at compile time to permanently disable deep sleep,
+// overriding the NVS setting. Useful during development/bench testing.
+// Can be set in platformio.ini: build_flags = -DFORCE_DEBUG_MODE
+#ifndef FORCE_DEBUG_MODE
+#define FORCE_DEBUG_MODE 0
+#endif
+
+bool debugMode      = FORCE_DEBUG_MODE;  // When true, deep sleep is completely disabled
+
 // ─── Diagnostic Mode State ────────────────────────────────────────────────────
 bool diagnosticMode = false;  // true when /diag/start has been called
 unsigned long lastDiagTelemetryTime = 0;
@@ -226,6 +236,7 @@ void loadSettings() {
     sleepEnabled = prefs.getBool("sleepOn", true);
     sampleRate = prefs.getUInt("sampleRate", DEFAULT_SAMPLE_RATE);
     configured = prefs.getBool("configured", false);
+    debugMode = prefs.getBool("debugMode", false) || FORCE_DEBUG_MODE;
     prefs.end();
 
     strncpy(udpHost, h.c_str(), sizeof(udpHost) - 1);
@@ -248,6 +259,7 @@ void saveSettings() {
     prefs.putBool("sleepOn", sleepEnabled);
     prefs.putUInt("sampleRate", sampleRate);
     prefs.putBool("configured", configured);
+    prefs.putBool("debugMode", debugMode);
     prefs.end();
 }
 
@@ -267,6 +279,7 @@ void handleGetConfig() {
     json += "\"longitude\":\"" + String(longitude) + "\",";
     json += "\"utc_offset\":\"" + String(utcOffset) + "\",";
     json += "\"sleep_enabled\":" + String(sleepEnabled ? "true" : "false") + ",";
+    json += "\"debug_mode\":" + String(debugMode ? "true" : "false") + ",";
     json += "\"configured\":" + String(configured ? "true" : "false");
     json += "}";
     server.send(200, "application/json", json);
@@ -314,12 +327,18 @@ void handlePostConfig() {
         sleepEnabled = (val == "true" || val == "1");
         changed = true;
     }
+    if (server.hasArg("debug_mode")) {
+        String val = server.arg("debug_mode");
+        debugMode = (val == "true" || val == "1");
+        changed = true;
+    }
 
     if (changed) {
         configured = true;
         saveSettings();
-        Serial.printf("[HTTP] Config updated — UDP: %s:%s, rate: %lu, sleep: %s\n",
-            udpHost, udpPort, (unsigned long)sampleRate, sleepEnabled ? "on" : "off");
+        Serial.printf("[HTTP] Config updated — UDP: %s:%s, rate: %lu, sleep: %s, debug: %s\n",
+            udpHost, udpPort, (unsigned long)sampleRate, sleepEnabled ? "on" : "off",
+            debugMode ? "on" : "off");
     }
 
     if (needsReboot) {
@@ -362,6 +381,7 @@ void handleGetStatus() {
     json += "\"sunrise\":\"" + sunriseStr + "\",";
     json += "\"sunset\":\"" + sunsetStr + "\",";
     json += "\"sleep_enabled\":" + String(sleepEnabled ? "true" : "false") + ",";
+    json += "\"debug_mode\":" + String(debugMode ? "true" : "false") + ",";
     json += "\"ip\":\"" + WiFi.localIP().toString() + "\",";
     json += "\"rssi\":" + String(WiFi.RSSI()) + ",";
     json += "\"battery_v\":" + String(lastBatteryVoltage, 3) + ",";
@@ -1066,6 +1086,7 @@ void wifiInit() {
     Serial.printf("[Config] Sample Rate  : %lu Hz\n", (unsigned long)sampleRate);
     Serial.printf("[Config] Location     : Lat %s, Lon %s, UTC%s\n", latitude, longitude, utcOffset);
     Serial.printf("[Config] Sleep Enabled: %s\n", sleepEnabled ? "yes" : "no");
+    Serial.printf("[Config] Debug Mode  : %s\n", debugMode ? "yes (sleep disabled)" : "no");
     Serial.println("[WiFi] ──────────────────────────────────────────────");
 }
 
@@ -1240,6 +1261,12 @@ uint64_t secondsUntilNextActiveWindow() {
 #define MAX_SLEEP_SECONDS  (2ULL * 3600)
 
 void enterDeepSleep(uint64_t sleepSeconds) {
+    // Debug mode: refuse to sleep under any circumstances
+    if (debugMode) {
+        Serial.printf("[Sleep] BLOCKED — debug mode active (would have slept %llu s)\n", sleepSeconds);
+        return;
+    }
+
     // Cap sleep duration to avoid RTC timer reliability issues
     if (sleepSeconds > MAX_SLEEP_SECONDS) {
         Serial.printf("[Sleep] Requested %llu s — capping to %llu s (will re-check on wake)\n",

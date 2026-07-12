@@ -167,11 +167,19 @@ def create_app(
 
     @app.get("/stream")
     async def stream(request: Request):
-        """Stream live audio as WAV (PCM 16-bit)."""
+        """Stream live audio as WAV (PCM 16-bit).
+
+        Paces output at real-time audio rate to prevent VLC clock drift.
+        Each PCM chunk corresponds to one decoded Opus frame (60ms at 48kHz).
+        """
         wav_header = make_wav_header(sample_rate, channels=channels)
+        frame_duration_s = 60.0 / 1000.0  # 60ms per decoded Opus frame
 
         async def audio_generator() -> AsyncGenerator[bytes, None]:
             yield wav_header
+            frames_sent = 0
+            initial_burst_frames = int(2.0 / frame_duration_s)  # ~33 frames
+
             async for chunk in audio_buffer.stream_from():
                 if await request.is_disconnected():
                     break
@@ -183,6 +191,10 @@ def create_app(
                 if normalizer is not None:
                     processed = normalizer.normalize(processed)
                 yield processed
+
+                frames_sent += 1
+                if frames_sent > initial_burst_frames:
+                    await asyncio.sleep(frame_duration_s * 0.9)
 
         return StreamingResponse(
             audio_generator(),
@@ -198,18 +210,33 @@ def create_app(
     async def stream_opus(request: Request):
         """Stream live audio as Ogg/Opus (passthrough, no decoding/re-encoding).
 
-        Frames are flushed individually per Ogg page for low-latency delivery.
-        The OggOpusStream handles proper granule position accounting (including
-        pre-skip) so VLC can establish a correct PCR reference.
+        Frames are paced at real-time rate to prevent VLC clock issues.
+        The ESP32 sends audio in ~1-second bursts, but VLC expects data to
+        arrive at a steady rate. Without pacing, VLC sees the bursty arrival
+        pattern and reports "buffer too late" / "PCR is called too late" errors,
+        causing playback to stutter and repeatedly rebuffer.
+
+        The pacing strategy: accumulate burst frames immediately, then yield
+        them to the client at the audio's natural rate (one frame per
+        OPUS_FRAME_MS). This transforms bursty network delivery into smooth
+        playback-rate delivery that VLC's clock can track.
         """
+        # Frame duration in seconds (60ms for this encoder)
+        frame_duration_s = 60.0 / 1000.0  # OPUS_FRAME_MS / 1000
 
         async def opus_generator() -> AsyncGenerator[bytes, None]:
             ogg_stream = OggOpusStream(sample_rate=sample_rate, channels=channels)
             yield ogg_stream.get_headers()
 
+            # For the initial burst, send frames immediately to fill VLC's
+            # buffer quickly. After that, pace delivery at real-time rate.
+            frames_sent = 0
+            # Let the first ~2 seconds through unthrottled so VLC's initial
+            # buffering phase completes quickly.
+            initial_burst_frames = int(2.0 / frame_duration_s)  # ~33 frames
+
             try:
                 async for opus_frame in opus_buffer.stream_from():
-                    # Check if client has disconnected
                     if await request.is_disconnected():
                         logger.debug("[Opus] Client disconnected, closing stream")
                         break
@@ -217,6 +244,12 @@ def create_app(
                     page_data = ogg_stream.write_opus_frame(opus_frame)
                     if page_data:
                         yield page_data
+
+                    frames_sent += 1
+
+                    # After initial burst, pace at real-time to keep VLC happy
+                    if frames_sent > initial_burst_frames:
+                        await asyncio.sleep(frame_duration_s * 0.9)
             finally:
                 closing_data = ogg_stream.close()
                 if closing_data:
