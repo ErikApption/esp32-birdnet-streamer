@@ -49,7 +49,9 @@ EXPOSE 4000/udp
 # Environment variables for Docker bridge networking:
 #   BIRDNET_HOST_IP    - Host's real LAN IP (advertised to ESP32)
 #   BIRDNET_ESP32_IP   - ESP32 IP (skips mDNS discovery)
+#   BUFFER_MS          - Opus playout buffer in ms (default: ~48000, lower = less latency)
 #
 # For mDNS to work, use --network host instead of bridge networking.
 
 ENTRYPOINT ["birdnet-listener"]
+CMD []

@@ -70,10 +70,19 @@ def create_app(
     normalizer: AudioNormalizer | None = None,
     noise_reducer: NoiseReducer | None = None,
     discovery_stop_event: threading.Event | None = None,
+    opus_buffer_ms: int | None = None,
 ) -> FastAPI:
     app = FastAPI(title="BirdNet Listener")
     audio_buffer = StreamBuffer()
-    opus_buffer = StreamBuffer(max_chunks=800)
+
+    # Each Opus frame is 60ms. Default: 800 frames = ~48s of buffered audio.
+    # With --buffer-ms, use fewer frames to reduce latency (e.g., 3000ms = 50 frames).
+    frame_duration_ms = 60
+    if opus_buffer_ms is not None:
+        opus_max_chunks = max(1, opus_buffer_ms // frame_duration_ms)
+    else:
+        opus_max_chunks = 800
+    opus_buffer = StreamBuffer(max_chunks=opus_max_chunks)
     udp_protocol: UDPReceiverProtocol | None = None
 
     @app.on_event("startup")
@@ -101,6 +110,8 @@ def create_app(
             "sample_rate": sample_rate,
             "normalize": normalizer is not None,
             "noise_reduce": noise_reducer is not None,
+            "opus_buffer_chunks": opus_max_chunks,
+            "opus_buffer_ms": opus_max_chunks * frame_duration_ms,
             "packets_received": udp_protocol.packets_received if udp_protocol else 0,
             "invalid_packets": udp_protocol._invalid_packets if udp_protocol else 0,
             "decode_errors": udp_protocol._decode_errors if udp_protocol else 0,
@@ -336,8 +347,24 @@ def main():
         "--noise-reduce-threshold-db", type=float, default=-12.0,
         help="Gate threshold in dB above noise floor (default: -12.0, lower = more aggressive)",
     )
+    parser.add_argument(
+        "--buffer-ms", type=int, default=None,
+        help="Opus stream playout buffer size in milliseconds. Controls the amount of audio "
+             "pre-buffered before streaming begins. Lower values reduce latency but may cause "
+             "stuttering. Default is ~48000ms (800 frames × 60ms). Try 3000-5000 for low-latency testing. "
+             "Can also be set via BUFFER_MS environment variable.",
+    )
     parser.add_argument("--log-level", default="info", choices=["debug", "info", "warning", "error"])
     args = parser.parse_args()
+
+    # Allow BUFFER_MS env var as fallback for --buffer-ms (convenient for Docker)
+    if args.buffer_ms is None:
+        env_buffer_ms = os.environ.get("BUFFER_MS")
+        if env_buffer_ms:
+            try:
+                args.buffer_ms = int(env_buffer_ms)
+            except ValueError:
+                pass
 
     logging.basicConfig(
         level=getattr(logging, args.log_level.upper()),
@@ -387,9 +414,16 @@ def main():
         normalizer=normalizer,
         noise_reducer=noise_reducer,
         discovery_stop_event=discovery_stop_event,
+        opus_buffer_ms=args.buffer_ms,
     )
 
     logger.info(f"Starting BirdNet Listener — UDP:{args.udp_port} → HTTP:{args.http_port}")
+    if args.buffer_ms is not None:
+        frame_duration_ms = 60
+        effective_chunks = max(1, args.buffer_ms // frame_duration_ms)
+        logger.info(f"Opus buffer: {args.buffer_ms}ms ({effective_chunks} frames) — low-latency mode")
+    else:
+        logger.info("Opus buffer: default (800 frames, ~48s)")
     logger.info(f"Playlist URL: http://0.0.0.0:{args.http_port}/stream.m3u")
     logger.info(f"WAV stream:   http://0.0.0.0:{args.http_port}/stream")
     logger.info(f"Opus stream:  http://0.0.0.0:{args.http_port}/stream.opus")

@@ -21,3 +21,4 @@ services:
     profiles: ["host"]
     environment:
       - BIRDNET_ESP32_IP=${BIRDNET_ESP32_IP:-}
+      - BUFFER_MS=${BUFFER_MS:-}
