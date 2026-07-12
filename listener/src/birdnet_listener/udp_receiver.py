@@ -87,7 +87,8 @@ class UDPReceiverProtocol(asyncio.DatagramProtocol):
     PACKET_MAGIC = b"OP"
     TELEMETRY_MAGIC = b"TL"
     HEADER_SIZE = 4  # 2 bytes magic + 1 byte frame_count + 1 byte sequence_number
-    TELEMETRY_SIZE = 6  # 2 magic + 2 bat_adc_mV + 2 sol_adc_mV
+    TELEMETRY_SIZE = 6  # 2 magic + 2 bat_adc_mV + 2 sol_adc_mV (minimum, backward-compat)
+    TELEMETRY_EXTENDED_SIZE = 22  # 6 base + 2 rssi + 4 sent + 4 errors + 4 dropped + 1 wifi + 1 consec_fails
     FRAME_SIZE = 2880  # 60ms at 48kHz mono (samples per frame)
     LARGE_GAP_THRESHOLD = 128  # gaps larger than this are treated as reordering
 
@@ -134,6 +135,7 @@ class UDPReceiverProtocol(asyncio.DatagramProtocol):
         self.channels = channels
         self.packets_received = 0
         self._receiving = False
+        self._stream_start_time: float = 0.0  # monotonic time when current uninterrupted stream began
         self._packets_since_last_log = 0
         self._bytes_since_last_log = 0
         self._decode_errors = 0
@@ -153,6 +155,14 @@ class UDPReceiverProtocol(asyncio.DatagramProtocol):
         self.battery_percent: int = 0
         self.is_charging: bool = False
         self._telemetry_received: int = 0
+
+        # ─── ESP32 UDP stats (from extended telemetry) ───────────────────
+        self.esp_rssi: int = 0                  # WiFi RSSI in dBm
+        self.esp_udp_sent: int = 0              # total packets sent by ESP32
+        self.esp_udp_errors: int = 0            # total send errors on ESP32
+        self.esp_udp_dropped: int = 0           # packets dropped due to ring overflow
+        self.esp_wifi_connected: bool = False    # ESP32 WiFi link status
+        self.esp_consecutive_fails: int = 0     # current failure streak
 
         # ─── Audio diagnostics state (per log interval) ──────────────────
         self._diag_frames_decoded: int = 0       # Opus frames successfully decoded
@@ -185,6 +195,26 @@ class UDPReceiverProtocol(asyncio.DatagramProtocol):
             self._decoder_needs_reset = False
         return self._opus_decoder
 
+    @property
+    def stream_uptime_seconds(self) -> float:
+        """Seconds of uninterrupted audio reception, or 0 if not currently receiving."""
+        if not self._receiving or self._stream_start_time == 0.0:
+            return 0.0
+        return time.monotonic() - self._stream_start_time
+
+    @staticmethod
+    def _format_uptime(seconds: float) -> str:
+        """Format uptime as a human-readable string (e.g., '2h 15m 30s')."""
+        if seconds < 60:
+            return f"{seconds:.0f}s"
+        minutes = int(seconds) // 60
+        secs = int(seconds) % 60
+        if minutes < 60:
+            return f"{minutes}m {secs}s"
+        hours = minutes // 60
+        mins = minutes % 60
+        return f"{hours}h {mins}m {secs}s"
+
     def connection_made(self, transport) -> None:
         self.transport = transport
         self._schedule_log()
@@ -212,10 +242,12 @@ class UDPReceiverProtocol(asyncio.DatagramProtocol):
             if not self._receiving:
                 logger.info("[UDP] Receiving audio stream")
                 self._receiving = True
+                self._stream_start_time = time.monotonic()
             msg = (
                 f"[UDP] {self._packets_since_last_log} packets received "
                 f"({self._bytes_since_last_log / 1024:.1f} KB) in the last "
                 f"{self.LOG_INTERVAL:.0f}s — total: {self.packets_received}"
+                f" — uptime: {self._format_uptime(self.stream_uptime_seconds)}"
             )
             if self._dropped_packets > 0:
                 msg += f" — dropped: {self._dropped_packets}"
@@ -227,8 +259,10 @@ class UDPReceiverProtocol(asyncio.DatagramProtocol):
             self._log_audio_diagnostics()
         else:
             if self._receiving:
-                logger.info("[UDP] Stream stopped — no packets received")
+                uptime = self.stream_uptime_seconds
+                logger.info(f"[UDP] Stream stopped — no packets received (was up for {self._format_uptime(uptime)})")
                 self._receiving = False
+                self._stream_start_time = 0.0
                 self._diag_total_interruptions += 1
 
         self._packets_since_last_log = 0
@@ -369,17 +403,35 @@ class UDPReceiverProtocol(asyncio.DatagramProtocol):
                     pct = (self.battery_voltage - self.VBAT_EMPTY) / (self.VBAT_FULL - self.VBAT_EMPTY) * 100.0
                     self.battery_percent = int(max(0, min(100, pct)))
 
+                # ─── Parse extended UDP stats if present ──────────────────
+                if len(data) >= self.TELEMETRY_EXTENDED_SIZE:
+                    self.esp_rssi = int.from_bytes(data[6:8], "big", signed=True)
+                    self.esp_udp_sent = int.from_bytes(data[8:12], "big")
+                    self.esp_udp_errors = int.from_bytes(data[12:16], "big")
+                    self.esp_udp_dropped = int.from_bytes(data[16:20], "big")
+                    self.esp_wifi_connected = data[20] == 1
+                    self.esp_consecutive_fails = data[21]
+
                 self._telemetry_received += 1
                 if self._telemetry_received <= 3 or self._telemetry_received % 60 == 0:
                     if charging:
                         status = f"charging (bat sense: {self.battery_voltage:.2f}V — charger voltage, not true SoC)"
                     else:
                         status = f"{self.battery_voltage:.2f}V ({self.battery_percent}%)"
-                    logger.info(
+                    log_msg = (
                         f"[Telemetry] Battery: {status}, "
                         f"Solar: {self.solar_voltage:.2f}V "
                         f"(raw ADC: bat={bat_adc_mv}mV, sol={sol_adc_mv}mV)"
                     )
+                    if len(data) >= self.TELEMETRY_EXTENDED_SIZE:
+                        log_msg += (
+                            f" | RSSI: {self.esp_rssi}dBm"
+                            f" | UDP: sent={self.esp_udp_sent} err={self.esp_udp_errors}"
+                            f" drop={self.esp_udp_dropped}"
+                        )
+                        if self.esp_consecutive_fails > 0:
+                            log_msg += f" (failing: {self.esp_consecutive_fails}x)"
+                    logger.info(log_msg)
             return
 
         if data[0:2] != self.PACKET_MAGIC:

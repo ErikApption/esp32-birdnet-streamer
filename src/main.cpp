@@ -30,6 +30,11 @@
 // ─── UDP Configuration ───────────────────────────────────────────────────────
 #define DEFAULT_UDP_HOST  "192.168.1.100"
 #define DEFAULT_UDP_PORT  4000
+#define UDP_RETRY_ATTEMPTS     3      // Retries per packet on send failure
+#define UDP_RETRY_DELAY_MS     2      // Delay between retries
+#define UDP_BACKOFF_BASE_MS    50     // Base backoff after burst failure
+#define UDP_BACKOFF_MAX_MS     5000   // Maximum backoff duration
+#define UDP_STATS_INTERVAL_MS  (30 * 1000)  // Log UDP stats every 30s
 
 // ─── Opus Encoder Configuration ─────────────────────────────────────────────
 #define OPUS_FRAME_MS         60    // 60ms frames — maximum efficiency, fewer packets
@@ -59,10 +64,10 @@
 #define ADC_SAMPLES       16
 #define POWER_READ_INTERVAL_MS  (60 * 1000)  // Read every 60 seconds
 
-// Telemetry packet: magic "TL" + battery_adc_mV (uint16) + solar_adc_mV (uint16)
+// Telemetry packet: magic "TL" + battery_adc_mV (uint16) + solar_adc_mV (uint16) + UDP stats
 #define TELEMETRY_MAGIC_0   0x54  // 'T'
 #define TELEMETRY_MAGIC_1   0x4C  // 'L'
-#define TELEMETRY_PACKET_SIZE 6   // 2 magic + 2 bat_adc_mV + 2 sol_adc_mV
+#define TELEMETRY_PACKET_SIZE 22  // 2 magic + 2 bat + 2 sol + 2 rssi + 4 sent + 4 errors + 4 dropped + 1 wifi + 1 consec_fails
 
 // ─── HTTP Config Server ──────────────────────────────────────────────────────
 #define HTTP_PORT         80
@@ -106,6 +111,13 @@ unsigned long lastPowerReadTime = 0;
 IPAddress resolvedUdpAddr;
 unsigned long lastResolveTime = 0;
 unsigned long udpSendErrors = 0;
+unsigned long udpSendSuccess = 0;
+unsigned long udpBurstCount = 0;
+unsigned long udpPacketsDropped = 0;       // packets lost due to ring buffer overflow
+unsigned long udpConsecutiveFails = 0;     // current streak of failed sends
+unsigned long udpBackoffMs = 0;            // current dynamic backoff in ms
+unsigned long lastUdpStatsTime = 0;        // last time UDP stats were logged
+unsigned long lastBurstFailTime = 0;       // time of last burst failure (for backoff)
 bool udpFirstPacketLogged = false;
 
 uint32_t sampleRate = DEFAULT_SAMPLE_RATE;
@@ -156,6 +168,7 @@ void opusInit();
 void udpInit();
 void flushUdpPacket(uint16_t port);
 void burstSendPackets();
+void logUdpStats();
 void httpInit();
 void mdnsInit();
 void startStreaming();
@@ -343,7 +356,17 @@ void handleGetStatus() {
     json += "\"rssi\":" + String(WiFi.RSSI()) + ",";
     json += "\"battery_v\":" + String(lastBatteryVoltage, 3) + ",";
     json += "\"solar_v\":" + String(lastSolarVoltage, 3) + ",";
-    json += "\"diagnostic\":" + String(diagnosticMode ? "true" : "false");
+    json += "\"diagnostic\":" + String(diagnosticMode ? "true" : "false") + ",";
+    json += "\"udp\":{";
+    json += "\"target\":\"" + String(udpHost) + ":" + String(udpPort) + "\",";
+    json += "\"resolved\":\"" + resolvedUdpAddr.toString() + "\",";
+    json += "\"sent\":" + String(udpSendSuccess) + ",";
+    json += "\"errors\":" + String(udpSendErrors) + ",";
+    json += "\"dropped\":" + String(udpPacketsDropped) + ",";
+    json += "\"consecutive_fails\":" + String(udpConsecutiveFails) + ",";
+    json += "\"backoff_ms\":" + String(udpBackoffMs) + ",";
+    json += "\"bursts\":" + String(udpBurstCount);
+    json += "}";
     json += "}";
     server.send(200, "application/json", json);
 }
@@ -565,6 +588,12 @@ void sendTelemetryPacket() {
     // Send raw ADC millivolts (before divider scaling)
     uint16_t batMv = (uint16_t)(lastBatteryVoltage * 1000.0f);
     uint16_t solMv = (uint16_t)(lastSolarVoltage * 1000.0f);
+    int16_t rssi = (int16_t)WiFi.RSSI();
+    uint32_t sent = (uint32_t)udpSendSuccess;
+    uint32_t errors = (uint32_t)udpSendErrors;
+    uint32_t dropped = (uint32_t)udpPacketsDropped;
+    uint8_t wifiStatus = (WiFi.status() == WL_CONNECTED) ? 1 : 0;
+    uint8_t consecFails = (uint8_t)min(udpConsecutiveFails, (unsigned long)255);
 
     uint8_t pkt[TELEMETRY_PACKET_SIZE];
     pkt[0] = TELEMETRY_MAGIC_0;       // 'T'
@@ -573,6 +602,23 @@ void sendTelemetryPacket() {
     pkt[3] = (uint8_t)(batMv & 0xFF);
     pkt[4] = (uint8_t)(solMv >> 8);   // solar ADC mV big-endian
     pkt[5] = (uint8_t)(solMv & 0xFF);
+    // ─── Extended fields (UDP stats) ────────────────────────────────────
+    pkt[6] = (uint8_t)(rssi >> 8);    // RSSI int16 big-endian
+    pkt[7] = (uint8_t)(rssi & 0xFF);
+    pkt[8]  = (uint8_t)(sent >> 24);  // UDP sent uint32 big-endian
+    pkt[9]  = (uint8_t)(sent >> 16);
+    pkt[10] = (uint8_t)(sent >> 8);
+    pkt[11] = (uint8_t)(sent & 0xFF);
+    pkt[12] = (uint8_t)(errors >> 24); // UDP errors uint32 big-endian
+    pkt[13] = (uint8_t)(errors >> 16);
+    pkt[14] = (uint8_t)(errors >> 8);
+    pkt[15] = (uint8_t)(errors & 0xFF);
+    pkt[16] = (uint8_t)(dropped >> 24); // UDP dropped uint32 big-endian
+    pkt[17] = (uint8_t)(dropped >> 16);
+    pkt[18] = (uint8_t)(dropped >> 8);
+    pkt[19] = (uint8_t)(dropped & 0xFF);
+    pkt[20] = wifiStatus;              // 1=connected, 0=disconnected
+    pkt[21] = consecFails;             // consecutive send failures (capped 255)
 
     udp.beginPacket(resolvedUdpAddr, port);
     udp.write(pkt, TELEMETRY_PACKET_SIZE);
@@ -1223,6 +1269,19 @@ void udpInit() {
         Serial.println("[UDP] ERROR: Failed to bind socket!");
     }
     Serial.printf("[UDP] Target: %s:%s\n", udpHost, udpPort);
+    Serial.printf("[UDP] Retry: %d attempts, %dms delay | Backoff: %d-%dms\n",
+        UDP_RETRY_ATTEMPTS, UDP_RETRY_DELAY_MS, UDP_BACKOFF_BASE_MS, UDP_BACKOFF_MAX_MS);
+
+    // Resolve target immediately so first burst doesn't fail
+    resolvedUdpAddr = resolveHost(udpHost);
+    lastResolveTime = millis();
+    if (resolvedUdpAddr != IPAddress(0, 0, 0, 0)) {
+        Serial.printf("[UDP] Resolved target: %s -> %s\n", udpHost, resolvedUdpAddr.toString().c_str());
+    } else {
+        Serial.printf("[UDP] WARNING: Cannot resolve %s — will retry later\n", udpHost);
+    }
+
+    lastUdpStatsTime = millis();
 }
 
 void streamAudio() {
@@ -1416,6 +1475,16 @@ void flushUdpPacket(uint16_t port) {
     if (nextWrite == burstReadIdx) {
         // Buffer full — force an immediate burst to drain
         burstSendPackets();
+
+        // If still full after burst attempt (sends are failing), drop oldest packet
+        nextWrite = (burstWriteIdx + 1) % BURST_MAX_PACKETS;
+        if (nextWrite == burstReadIdx) {
+            udpPacketsDropped++;
+            burstReadIdx = (burstReadIdx + 1) % BURST_MAX_PACKETS;
+            if (udpPacketsDropped <= 5 || udpPacketsDropped % 50 == 0) {
+                Serial.printf("[UDP] Ring buffer overflow — dropped packet #%lu\n", udpPacketsDropped);
+            }
+        }
     }
 
     memcpy(burstBuffer[burstWriteIdx].data, udpPacketBuffer, udpPacketOffset);
@@ -1427,45 +1496,148 @@ void flushUdpPacket(uint16_t port) {
     udpPacketFrameCount = 0;
 }
 
+// Log periodic UDP performance stats for diagnostics
+void logUdpStats() {
+    unsigned long total = udpSendSuccess + udpSendErrors;
+    if (total == 0) return;
+
+    float successRate = (udpSendSuccess * 100.0f) / total;
+    int queued = (burstWriteIdx - burstReadIdx + BURST_MAX_PACKETS) % BURST_MAX_PACKETS;
+
+    Serial.printf("[UDP:Stats] sent=%lu fail=%lu (%.1f%% success) | "
+                  "dropped=%lu bursts=%lu | "
+                  "queue=%d/%d | backoff=%lums | RSSI=%d\n",
+        udpSendSuccess, udpSendErrors, successRate,
+        udpPacketsDropped, udpBurstCount,
+        queued, BURST_MAX_PACKETS - 1,
+        udpBackoffMs, WiFi.RSSI());
+
+    if (udpConsecutiveFails > 0) {
+        Serial.printf("[UDP:Stats] Currently in failure state: %lu consecutive fails\n",
+            udpConsecutiveFails);
+    }
+
+    lastUdpStatsTime = millis();
+}
+
 // Burst-send all queued packets at once — minimizes WiFi radio active time
 void burstSendPackets() {
     if (burstReadIdx == burstWriteIdx) return;  // nothing queued
 
-    if (resolvedUdpAddr == IPAddress(0, 0, 0, 0)) return;
+    if (resolvedUdpAddr == IPAddress(0, 0, 0, 0)) {
+        // Try to re-resolve immediately rather than waiting for the periodic timer
+        resolvedUdpAddr = resolveHost(udpHost);
+        lastResolveTime = millis();
+        if (resolvedUdpAddr == IPAddress(0, 0, 0, 0)) {
+            return;
+        }
+        Serial.printf("[UDP] Re-resolved target: %s -> %s\n", udpHost, resolvedUdpAddr.toString().c_str());
+    }
+
+    // Check WiFi is actually connected before attempting to send
+    if (WiFi.status() != WL_CONNECTED) {
+        // Don't burn send attempts when WiFi is down — just skip this burst
+        if (udpConsecutiveFails == 0) {
+            Serial.println("[UDP] WiFi disconnected — skipping burst");
+        }
+        udpConsecutiveFails++;
+        return;
+    }
+
+    // Respect dynamic backoff after repeated failures
+    if (udpBackoffMs > 0 && (millis() - lastBurstFailTime) < udpBackoffMs) {
+        return;  // Still in backoff period
+    }
 
     uint16_t port = (uint16_t)atoi(udpPort);
     int packetsSent = 0;
+    int packetsFailed = 0;
 
     while (burstReadIdx != burstWriteIdx) {
         BurstPacket &pkt = burstBuffer[burstReadIdx];
+        bool sent = false;
 
-        if (!udp.beginPacket(resolvedUdpAddr, port)) {
-            delay(1);
-            break;  // Socket not ready — try again next burst
+        // Retry loop for each packet
+        for (int attempt = 0; attempt < UDP_RETRY_ATTEMPTS; attempt++) {
+            if (!udp.beginPacket(resolvedUdpAddr, port)) {
+                if (attempt < UDP_RETRY_ATTEMPTS - 1) {
+                    delay(UDP_RETRY_DELAY_MS);
+                    continue;
+                }
+                break;  // All retries exhausted for beginPacket
+            }
+            udp.write(pkt.data, pkt.length);
+            if (udp.endPacket()) {
+                sent = true;
+                break;
+            }
+
+            // endPacket failed — retry after brief delay
+            if (attempt < UDP_RETRY_ATTEMPTS - 1) {
+                delay(UDP_RETRY_DELAY_MS);
+            }
         }
-        udp.write(pkt.data, pkt.length);
-        int sent = udp.endPacket();
 
         if (sent) {
             packetsSent++;
+            udpSendSuccess++;
             if (!udpFirstPacketLogged) {
                 Serial.printf("[UDP] First burst sent (%d bytes to %s:%d)\n",
                     pkt.length, resolvedUdpAddr.toString().c_str(), port);
                 udpFirstPacketLogged = true;
             }
         } else {
+            packetsFailed++;
             udpSendErrors++;
-            if (udpSendErrors == 1 || udpSendErrors == 100 || udpSendErrors == 1000 ||
-                udpSendErrors % 10000 == 0) {
-                Serial.printf("[UDP] Send failed (total errors: %lu)\n", udpSendErrors);
+
+            // Log failures with context — include WiFi RSSI for correlation
+            if (udpSendErrors <= 5 || udpSendErrors % 100 == 0) {
+                Serial.printf("[UDP] Send failed #%lu (RSSI: %d dBm, heap: %lu, pkt_len: %d)\n",
+                    udpSendErrors, WiFi.RSSI(), (unsigned long)ESP.getFreeHeap(), pkt.length);
             }
-            break;  // Back off on failure
+
+            // Stop this burst on failure — remaining packets stay queued
+            break;
         }
 
         burstReadIdx = (burstReadIdx + 1) % BURST_MAX_PACKETS;
         yield();  // Let lwIP process between packets in the burst
     }
 
+    // Update backoff state based on burst outcome
+    if (packetsFailed > 0) {
+        udpConsecutiveFails++;
+        lastBurstFailTime = millis();
+
+        // Exponential backoff: double each time, capped at max
+        if (udpBackoffMs == 0) {
+            udpBackoffMs = UDP_BACKOFF_BASE_MS;
+        } else {
+            udpBackoffMs = min(udpBackoffMs * 2, (unsigned long)UDP_BACKOFF_MAX_MS);
+        }
+
+        // If we've been failing a lot, try re-resolving the target
+        if (udpConsecutiveFails == 10 || udpConsecutiveFails == 50) {
+            Serial.printf("[UDP] %lu consecutive failures — re-resolving target\n", udpConsecutiveFails);
+            resolvedUdpAddr = resolveHost(udpHost);
+            lastResolveTime = millis();
+            if (resolvedUdpAddr == IPAddress(0, 0, 0, 0)) {
+                Serial.printf("[UDP] Cannot resolve %s — target unreachable\n", udpHost);
+            } else {
+                Serial.printf("[UDP] Re-resolved: %s -> %s\n", udpHost, resolvedUdpAddr.toString().c_str());
+            }
+        }
+    } else if (packetsSent > 0) {
+        // Success — reset backoff state
+        if (udpConsecutiveFails > 0) {
+            Serial.printf("[UDP] Recovered after %lu consecutive failures (backoff was %lums)\n",
+                udpConsecutiveFails, udpBackoffMs);
+        }
+        udpConsecutiveFails = 0;
+        udpBackoffMs = 0;
+    }
+
+    udpBurstCount++;
     lastBurstTime = millis();
 }
 
@@ -1642,6 +1814,11 @@ void loop() {
             lastPowerReadTime = millis();
             readPowerMonitor();
             sendTelemetryPacket();
+        }
+
+        // Periodically log UDP performance stats
+        if (millis() - lastUdpStatsTime >= UDP_STATS_INTERVAL_MS) {
+            logUdpStats();
         }
 
         // Update onboard LED to reflect I2S signal status

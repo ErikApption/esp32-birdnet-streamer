@@ -110,6 +110,8 @@ def create_app(
             "active_subscribers": len(audio_buffer._subscribers),
             "active_opus_subscribers": len(opus_buffer._subscribers),
             "audio_diagnostics": {
+                "stream_uptime_seconds": round(udp_protocol.stream_uptime_seconds, 1) if udp_protocol else 0,
+                "stream_uptime": udp_protocol._format_uptime(udp_protocol.stream_uptime_seconds) if udp_protocol else "—",
                 "total_interruptions": udp_protocol._diag_total_interruptions if udp_protocol else 0,
                 "consecutive_silent_intervals": udp_protocol._diag_total_silent_intervals if udp_protocol else 0,
                 "reordered_packets_recovered": udp_protocol._diag_reordered_packets if udp_protocol else 0,
@@ -133,6 +135,14 @@ def create_app(
                 "solar_voltage": udp_protocol.solar_voltage if udp_protocol else 0.0,
                 "is_charging": udp_protocol.is_charging if udp_protocol else False,
                 "telemetry_packets": udp_protocol._telemetry_received if udp_protocol else 0,
+            },
+            "esp32_udp": {
+                "rssi": udp_protocol.esp_rssi if udp_protocol else 0,
+                "packets_sent": udp_protocol.esp_udp_sent if udp_protocol else 0,
+                "send_errors": udp_protocol.esp_udp_errors if udp_protocol else 0,
+                "packets_dropped": udp_protocol.esp_udp_dropped if udp_protocol else 0,
+                "wifi_connected": udp_protocol.esp_wifi_connected if udp_protocol else False,
+                "consecutive_fails": udp_protocol.esp_consecutive_fails if udp_protocol else 0,
             },
             "endpoints": {
                 "playlist": "/stream.m3u",
