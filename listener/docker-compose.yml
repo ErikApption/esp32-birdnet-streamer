@@ -28,4 +28,3 @@ services:
 #      - MQTT_USERNAME=${MQTT_USERNAME:-}
 #      - MQTT_PASSWORD=${MQTT_PASSWORD:-}
 #      - MQTT_ENTITY_NAME=${MQTT_ENTITY_NAME:-BirdNet Streamer}
-#      - MQTT_INTERVAL=${MQTT_INTERVAL:-30}

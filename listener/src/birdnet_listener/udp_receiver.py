@@ -127,6 +127,7 @@ class UDPReceiverProtocol(asyncio.DatagramProtocol):
         channels: int = 1,
         opus_buffer: StreamBuffer | None = None,
         discovery_stop_event: threading.Event | None = None,
+        on_telemetry: "Callable[[], None] | None" = None,
     ):
         self.audio_buffer = audio_buffer
         self.opus_buffer = opus_buffer
@@ -143,6 +144,7 @@ class UDPReceiverProtocol(asyncio.DatagramProtocol):
         self._expected_seq: int | None = None
         self._log_task: asyncio.TimerHandle | None = None
         self._discovery_stop_event = discovery_stop_event
+        self._on_telemetry = on_telemetry
 
         # Decoder is created lazily when first needed
         self._opus_decoder: opuslib.Decoder | None = None
@@ -709,6 +711,10 @@ class UDPReceiverProtocol(asyncio.DatagramProtocol):
                 if self.esp_consecutive_fails > 0:
                     log_msg += f" (failing: {self.esp_consecutive_fails}x)"
             logger.info(log_msg)
+
+        # Notify telemetry callback (e.g., MQTT publisher)
+        if self._on_telemetry is not None:
+            self._on_telemetry()
 
     def _analyze_pcm_frame(self, pcm: bytes) -> None:
         """Analyze a decoded PCM frame for silence, quiet, or clipping."""

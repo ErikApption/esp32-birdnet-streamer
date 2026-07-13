@@ -97,6 +97,7 @@ def create_app(
                 audio_buffer, sample_rate, channels,
                 opus_buffer=opus_buffer,
                 discovery_stop_event=discovery_stop_event,
+                on_telemetry=mqtt_integration.on_telemetry_received if mqtt_integration else None,
             ),
             local_addr=("0.0.0.0", udp_port),
             family=socket.AF_INET,
@@ -391,11 +392,6 @@ def main():
         help="Name of the device entity in Home Assistant (default: 'BirdNet Streamer'). "
              "Can also be set via MQTT_ENTITY_NAME env var.",
     )
-    parser.add_argument(
-        "--mqtt-interval", type=float, default=30.0,
-        help="Seconds between MQTT telemetry updates (default: 30). "
-             "Can also be set via MQTT_INTERVAL env var.",
-    )
     parser.add_argument("--log-level", default="info", choices=["debug", "info", "warning", "error"])
     args = parser.parse_args()
 
@@ -462,12 +458,11 @@ def main():
             entity_name=args.mqtt_entity_name
             if args.mqtt_entity_name != "BirdNet Streamer"
             else os.environ.get("MQTT_ENTITY_NAME", "BirdNet Streamer"),
-            update_interval=float(os.environ.get("MQTT_INTERVAL", str(args.mqtt_interval))),
         )
         mqtt_integration = MQTTHAIntegration(mqtt_config)
         logger.info(
             f"[MQTT] Enabled — broker: {mqtt_config.host}:{mqtt_config.port}, "
-            f"entity: '{mqtt_config.entity_name}', interval: {mqtt_config.update_interval}s"
+            f"entity: '{mqtt_config.entity_name}'"
         )
     else:
         logger.info("[MQTT] Disabled (no --mqtt-server or MQTT_SERVER set)")

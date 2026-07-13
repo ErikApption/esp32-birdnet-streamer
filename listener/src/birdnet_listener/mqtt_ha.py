@@ -4,6 +4,9 @@ Home Assistant MQTT integration using kellerza/mqtt_entity.
 Publishes ESP32 BirdNet telemetry data as Home Assistant entities via MQTT
 discovery. Creates a device with sensors for battery, solar, WiFi, and
 stream diagnostics.
+
+Updates are published each time a telemetry packet is received from the ESP32,
+rather than on a fixed polling interval.
 """
 
 import asyncio
@@ -26,7 +29,6 @@ class MQTTConfig:
     username: str = ""
     password: str = ""
     entity_name: str = "BirdNet Streamer"
-    update_interval: float = 30.0  # seconds between telemetry publishes
 
     @property
     def enabled(self) -> bool:
@@ -38,7 +40,6 @@ def _build_device(entity_name: str) -> tuple[MQTTDevice, dict[str, MQTTSensorEnt
     """Build the MQTTDevice with all sensor entities for the BirdNet streamer."""
     device_id = "birdnet_streamer"
     state_topic = f"{TOPIC_PREFIX}/{device_id}/state"
-    attrs_topic = f"{TOPIC_PREFIX}/{device_id}/attributes"
 
     # Define all sensor entities
     sensors: dict[str, MQTTSensorEntity | MQTTBinarySensorEntity] = {}
@@ -145,18 +146,22 @@ def _build_device(entity_name: str) -> tuple[MQTTDevice, dict[str, MQTTSensorEnt
 
 
 class MQTTHAIntegration:
-    """Manages the MQTT connection and telemetry publishing to Home Assistant."""
+    """Manages the MQTT connection and telemetry publishing to Home Assistant.
+
+    Telemetry is published reactively each time a telemetry packet arrives
+    from the ESP32 (via the on_telemetry callback on UDPReceiverProtocol).
+    """
 
     def __init__(self, config: MQTTConfig):
         self.config = config
         self._client: MQTTClient | None = None
         self._device: MQTTDevice | None = None
         self._sensors: dict[str, MQTTSensorEntity | MQTTBinarySensorEntity] = {}
-        self._task: asyncio.Task | None = None
         self._udp_protocol = None
+        self._loop: asyncio.AbstractEventLoop | None = None
 
     async def start(self, udp_protocol_getter) -> None:
-        """Start the MQTT client and begin publishing telemetry.
+        """Start the MQTT client and register for telemetry callbacks.
 
         Args:
             udp_protocol_getter: A callable that returns the UDPReceiverProtocol
@@ -166,6 +171,7 @@ class MQTTHAIntegration:
             return
 
         self._udp_protocol_getter = udp_protocol_getter
+        self._loop = asyncio.get_running_loop()
         self._device, self._sensors = _build_device(self.config.entity_name)
 
         device_id = "birdnet_streamer"
@@ -194,33 +200,21 @@ class MQTTHAIntegration:
             f"publishing as '{self.config.entity_name}'"
         )
 
-        # Start the periodic telemetry publishing task
-        self._task = asyncio.create_task(self._publish_loop())
+    def on_telemetry_received(self) -> None:
+        """Callback invoked by UDPReceiverProtocol when a telemetry packet arrives.
+
+        This runs synchronously within datagram_received on the asyncio event loop,
+        so we schedule the async publish as a task.
+        """
+        if self._client is None or self._loop is None:
+            return
+        self._loop.create_task(self._publish_telemetry())
 
     async def stop(self) -> None:
-        """Stop the MQTT client and publishing task."""
-        if self._task:
-            self._task.cancel()
-            try:
-                await self._task
-            except asyncio.CancelledError:
-                pass
-
+        """Stop the MQTT client."""
         if self._client:
             await self._client.disconnect()
             logger.info("[MQTT] Disconnected")
-
-    async def _publish_loop(self) -> None:
-        """Periodically publish telemetry data to MQTT."""
-        while True:
-            try:
-                await asyncio.sleep(self.config.update_interval)
-                await self._publish_telemetry()
-            except asyncio.CancelledError:
-                raise
-            except Exception as e:
-                logger.error(f"[MQTT] Error publishing telemetry: {e}")
-                await asyncio.sleep(5)
 
     async def _publish_telemetry(self) -> None:
         """Read current telemetry from the UDP protocol and publish to MQTT."""
@@ -228,40 +222,43 @@ class MQTTHAIntegration:
         if protocol is None or self._client is None:
             return
 
-        # Power sensors
-        await self._sensors["battery_voltage"].send_state(
-            self._client, round(protocol.battery_voltage, 2)
-        )
-        await self._sensors["battery_percent"].send_state(
-            self._client, protocol.battery_percent
-        )
-        await self._sensors["solar_voltage"].send_state(
-            self._client, round(protocol.solar_voltage, 2)
-        )
-        await self._sensors["is_charging"].send_state(
-            self._client, protocol.is_charging
-        )
+        try:
+            # Power sensors
+            await self._sensors["battery_voltage"].send_state(
+                self._client, round(protocol.battery_voltage, 2)
+            )
+            await self._sensors["battery_percent"].send_state(
+                self._client, protocol.battery_percent
+            )
+            await self._sensors["solar_voltage"].send_state(
+                self._client, round(protocol.solar_voltage, 2)
+            )
+            await self._sensors["is_charging"].send_state(
+                self._client, protocol.is_charging
+            )
 
-        # WiFi / connectivity
-        await self._sensors["esp_rssi"].send_state(
-            self._client, protocol.esp_rssi
-        )
-        await self._sensors["esp_wifi_connected"].send_state(
-            self._client, protocol.esp_wifi_connected
-        )
+            # WiFi / connectivity
+            await self._sensors["esp_rssi"].send_state(
+                self._client, protocol.esp_rssi
+            )
+            await self._sensors["esp_wifi_connected"].send_state(
+                self._client, protocol.esp_wifi_connected
+            )
 
-        # Stream stats
-        await self._sensors["packets_received"].send_state(
-            self._client, protocol.packets_received
-        )
-        await self._sensors["stream_uptime"].send_state(
-            self._client, int(protocol.stream_uptime_seconds)
-        )
+            # Stream stats
+            await self._sensors["packets_received"].send_state(
+                self._client, protocol.packets_received
+            )
+            await self._sensors["stream_uptime"].send_state(
+                self._client, int(protocol.stream_uptime_seconds)
+            )
 
-        # ESP32 UDP diagnostics
-        await self._sensors["esp_udp_errors"].send_state(
-            self._client, protocol.esp_udp_errors
-        )
-        await self._sensors["esp_udp_dropped"].send_state(
-            self._client, protocol.esp_udp_dropped
-        )
+            # ESP32 UDP diagnostics
+            await self._sensors["esp_udp_errors"].send_state(
+                self._client, protocol.esp_udp_errors
+            )
+            await self._sensors["esp_udp_dropped"].send_state(
+                self._client, protocol.esp_udp_dropped
+            )
+        except Exception as e:
+            logger.error(f"[MQTT] Error publishing telemetry: {e}")
