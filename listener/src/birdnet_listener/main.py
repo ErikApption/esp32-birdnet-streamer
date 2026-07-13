@@ -25,6 +25,7 @@ from fastapi.responses import PlainTextResponse, StreamingResponse
 
 from birdnet_listener.audio_normalizer import AudioNormalizer
 from birdnet_listener.discovery import get_local_ip, run_discovery_in_background
+from birdnet_listener.mqtt_ha import MQTTConfig, MQTTHAIntegration
 from birdnet_listener.noise_reducer import NoiseReducer
 from birdnet_listener.ogg_opus_stream import OggOpusStream
 from birdnet_listener.udp_receiver import StreamBuffer, UDPReceiverProtocol
@@ -71,6 +72,7 @@ def create_app(
     noise_reducer: NoiseReducer | None = None,
     discovery_stop_event: threading.Event | None = None,
     opus_buffer_ms: int | None = None,
+    mqtt_integration: MQTTHAIntegration | None = None,
 ) -> FastAPI:
     app = FastAPI(title="BirdNet Listener")
     audio_buffer = StreamBuffer()
@@ -100,6 +102,18 @@ def create_app(
             family=socket.AF_INET,
         )
         logger.info(f"UDP listener started on port {udp_port}")
+
+        # Start MQTT integration if configured
+        if mqtt_integration:
+            try:
+                await mqtt_integration.start(lambda: udp_protocol)
+            except Exception as e:
+                logger.error(f"[MQTT] Failed to start: {e}")
+
+    @app.on_event("shutdown")
+    async def shutdown():
+        if mqtt_integration:
+            await mqtt_integration.stop()
 
     @app.get("/")
     async def index():
@@ -354,6 +368,34 @@ def main():
              "stuttering. Default is ~48000ms (800 frames × 60ms). Try 3000-5000 for low-latency testing. "
              "Can also be set via BUFFER_MS environment variable.",
     )
+    parser.add_argument(
+        "--mqtt-server", type=str, default=None,
+        help="MQTT broker host (e.g. 'homeassistant.local' or '192.168.1.10'). "
+             "MQTT integration is only enabled when this is set. "
+             "Can also be set via MQTT_SERVER environment variable.",
+    )
+    parser.add_argument(
+        "--mqtt-port", type=int, default=1883,
+        help="MQTT broker port (default: 1883). Can also be set via MQTT_PORT env var.",
+    )
+    parser.add_argument(
+        "--mqtt-username", type=str, default=None,
+        help="MQTT broker username. Can also be set via MQTT_USERNAME env var.",
+    )
+    parser.add_argument(
+        "--mqtt-password", type=str, default=None,
+        help="MQTT broker password. Can also be set via MQTT_PASSWORD env var.",
+    )
+    parser.add_argument(
+        "--mqtt-entity-name", type=str, default="BirdNet Streamer",
+        help="Name of the device entity in Home Assistant (default: 'BirdNet Streamer'). "
+             "Can also be set via MQTT_ENTITY_NAME env var.",
+    )
+    parser.add_argument(
+        "--mqtt-interval", type=float, default=30.0,
+        help="Seconds between MQTT telemetry updates (default: 30). "
+             "Can also be set via MQTT_INTERVAL env var.",
+    )
     parser.add_argument("--log-level", default="info", choices=["debug", "info", "warning", "error"])
     args = parser.parse_args()
 
@@ -406,6 +448,30 @@ def main():
             f"estimating noise profile from first ~2s of audio)"
         )
 
+    # ─── MQTT / Home Assistant integration ───────────────────────────────
+    mqtt_server = args.mqtt_server or os.environ.get("MQTT_SERVER", "")
+    mqtt_integration = None
+
+    if mqtt_server:
+        mqtt_port_env = os.environ.get("MQTT_PORT")
+        mqtt_config = MQTTConfig(
+            host=mqtt_server,
+            port=int(mqtt_port_env) if mqtt_port_env else args.mqtt_port,
+            username=args.mqtt_username or os.environ.get("MQTT_USERNAME", ""),
+            password=args.mqtt_password or os.environ.get("MQTT_PASSWORD", ""),
+            entity_name=args.mqtt_entity_name
+            if args.mqtt_entity_name != "BirdNet Streamer"
+            else os.environ.get("MQTT_ENTITY_NAME", "BirdNet Streamer"),
+            update_interval=float(os.environ.get("MQTT_INTERVAL", str(args.mqtt_interval))),
+        )
+        mqtt_integration = MQTTHAIntegration(mqtt_config)
+        logger.info(
+            f"[MQTT] Enabled — broker: {mqtt_config.host}:{mqtt_config.port}, "
+            f"entity: '{mqtt_config.entity_name}', interval: {mqtt_config.update_interval}s"
+        )
+    else:
+        logger.info("[MQTT] Disabled (no --mqtt-server or MQTT_SERVER set)")
+
     # ─── Start the HTTP + UDP server ──────────────────────────────────────
     app = create_app(
         udp_port=args.udp_port,
@@ -415,6 +481,7 @@ def main():
         noise_reducer=noise_reducer,
         discovery_stop_event=discovery_stop_event,
         opus_buffer_ms=args.buffer_ms,
+        mqtt_integration=mqtt_integration,
     )
 
     logger.info(f"Starting BirdNet Listener — UDP:{args.udp_port} → HTTP:{args.http_port}")

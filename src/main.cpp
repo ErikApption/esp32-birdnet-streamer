@@ -542,7 +542,7 @@ void powerMonitorInit() {
 
     // Step 2: Read with MOSFET ON — should see actual divided voltages
     digitalWrite(MONITOR_EN_PIN, HIGH);
-    delay(5);  // settling time
+    delay(5000);  // Full settling for large filter caps (~10µF × 100kΩ = 1s τ, need ~5τ)
     float batOn = readAdcVoltage(VBAT_ADC_PIN);
     float solOn = readAdcVoltage(VSOL_ADC_PIN);
     Serial.printf("[Power] │ MOSFET ON   — bat ADC: %.3fV, sol ADC: %.3fV\n", batOn, solOn);
@@ -599,7 +599,7 @@ void readPowerMonitor() {
     if (!diagnosticMode) {
         digitalWrite(MONITOR_EN_PIN, HIGH);
     }
-    delayMicroseconds(2000);  // RC settling — use microseconds to avoid triggering RTOS tick
+    delay(50);  // RC settling — τ = 100kΩ × 100nF = 10ms, need ~5τ for full charge
 
     float vBatAdc = readAdcVoltage(VBAT_ADC_PIN);
     float vSolAdc = readAdcVoltage(VSOL_ADC_PIN);

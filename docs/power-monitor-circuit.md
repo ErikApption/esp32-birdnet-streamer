@@ -195,10 +195,138 @@ Capacitor Polarity:
   C2: (+) → GPIO 9 / R3-R4 midpoint,  (−) → SW_GND (Q1 drain)
 ```
 
+## Validation & Troubleshooting
+
+### Boot Self-Test
+
+The firmware runs a diagnostic self-test at boot (`powerMonitorInit()`). Check serial output for:
+
+```
+[Power] ┌─── DIAGNOSTIC SELF-TEST ───────────────────────┐
+[Power] │ MOSFET OFF  — bat ADC: 0.003V, sol ADC: 0.002V
+[Power] │ ✓ OK — pins near 0V when dividers disabled
+[Power] │ MOSFET ON   — bat ADC: 1.800V, sol ADC: 0.000V
+[Power] │ Calculated  — bat: 3.60V, sol: 0.00V
+[Power] │ ✓ OK — battery 3.60V is within 3S NiMH range (3.0–4.5V)
+[Power] │ ℹ Solar: no voltage detected (panel disconnected or dark)
+[Power] │ Delta (on-off) — bat: 1.797V, sol: 0.002V
+[Power] └────────────────────────────────────────────────┘
+```
+
+### Interpreting Results
+
+| Symptom | Cause | Fix |
+|---------|-------|-----|
+| Both OFF and ON read ~3.1V | MOSFET not switching — no ground path | Check Q1 drain→divider bottom, source→GND, gate→GPIO 7 |
+| Both channels read identical values | ADC pins floating (railed to supply) | Verify MOSFET pinout (G-D-S left to right on TO-220) |
+| OFF reads >0.1V | Leakage or wrong pin wiring | Check 10kΩ gate pull-down; verify no short to supply |
+| ON reads 0V for battery | Divider upper leg open or battery disconnected | Check R1 connection to battery (+) |
+| Delta near 0 | MOSFET gate not driven | Confirm GPIO 7 reaches Q1 gate; check solder joint |
+| Battery reads >2.25V ADC (>4.5V real) | Wrong divider ratio or cross-wired | Verify R1=R2=100kΩ; check battery sense wire |
+
+### HTTP Diagnostic Mode
+
+Use the `/diag/start` endpoint for live validation:
+
+```bash
+# Start diagnostic mode (keeps MOSFET on, sends telemetry every 2s)
+curl http://esp32-birdnet.local/diag/start
+
+# Check current readings
+curl http://esp32-birdnet.local/status
+
+# Stop diagnostic mode
+curl http://esp32-birdnet.local/diag/stop
+```
+
+In diagnostic mode, the MOSFET stays on continuously so you can probe the divider nodes with a multimeter while the circuit is active.
+
+### Multimeter Validation Steps
+
+1. **Verify MOSFET switching**:
+   - Measure between Q1 drain and GND — should be near 0V when MOSFET is on, floating when off
+   - Measure Q1 gate to GND — should swing 0V ↔ 3.3V when `MONITOR_EN` toggles
+
+2. **Verify divider midpoints** (with MOSFET on / diagnostic mode active):
+   - GPIO 8 to GND: should read `V_bat / 2` (e.g., 1.8V for a 3.6V pack)
+   - GPIO 9 to GND: should read `V_solar / 3.2` (e.g., 1.7V for a 5.5V panel)
+   - If both read near battery voltage → ground path broken (MOSFET drain wiring)
+
+3. **Verify no-solar condition**:
+   - With solar disconnected, GPIO 9 should read ~0V when MOSFET is on
+   - If it reads the same as battery → pins may be bridged or R3/R4 miswired
+
+## Calibration
+
+The ESP32-S3 ADC has per-chip variation (typically ±3–6%). Two calibration approaches:
+
+### Option 1: Reference Voltage Calibration (Recommended)
+
+Apply a known voltage and compare to the reported ADC reading.
+
+1. Connect a known, stable voltage source to the battery divider input (e.g., a bench supply set to exactly 4.000V)
+2. Read the reported ADC voltage from serial or `/status` endpoint
+3. Calculate your chip's actual Vref:
+
+```
+actual_vref = known_voltage / 2 / reported_adc_voltage × ADC_VREF
+
+Example: Supply = 4.000V, divider output should be 2.000V
+         ESP32 reports 1.952V → actual_vref = 4.000 / 2 / 1.952 × 3.1 = 3.179V
+```
+
+4. Update `ADC_VREF` in `main.cpp`:
+
+```cpp
+#define ADC_VREF  3.179f  // Calibrated for this specific ESP32-S3
+```
+
+### Option 2: Per-Channel Scale Factors
+
+If both channels have different offsets (due to resistor tolerance), apply individual correction factors:
+
+1. Measure the actual battery voltage with a multimeter: e.g., 3.82V
+2. Read the firmware's calculated value from serial: e.g., `bat: 3.74V`
+3. Compute scale factor: `3.82 / 3.74 = 1.021`
+4. Apply in `readPowerMonitor()`:
+
+```cpp
+lastBatteryVoltage = vBatAdc * 1.021f;  // calibrated correction
+lastSolarVoltage   = vSolAdc * 1.005f;  // calibrated correction (measure separately)
+```
+
+### Option 3: ESP-IDF eFuse Calibration (Most Accurate)
+
+The ESP32-S3 stores factory ADC calibration data in eFuse. For maximum accuracy, use the `esp_adc_cal` API:
+
+```cpp
+#include <esp_adc_cal.h>
+
+esp_adc_cal_characteristics_t adcCal;
+esp_adc_cal_characterize(ADC_UNIT_1, ADC_ATTEN_DB_11, ADC_WIDTH_BIT_12, 0, &adcCal);
+
+// Then in readAdcVoltage():
+uint32_t voltage_mv;
+esp_adc_cal_get_voltage(ADC_CHANNEL_7, &adcCal, &voltage_mv);
+return voltage_mv / 1000.0f;
+```
+
+This accounts for per-chip Vref variation and non-linearity. It's the most accurate method but requires using the IDF ADC APIs instead of Arduino's `analogRead()`.
+
+### Resistor Tolerance Impact
+
+With 1% resistors, expect up to 2% error from the divider ratio alone:
+
+| Divider | Nominal Ratio | Worst-Case Error |
+|---------|---------------|------------------|
+| Battery (100k/100k) | 0.5000 | ±1% → 0.495–0.505 |
+| Solar (220k/100k) | 0.3125 | ±1.4% → 0.308–0.317 |
+
+For the battery channel, this means a 3.60V pack could read anywhere from 3.56V to 3.64V due to resistor tolerance alone, before ADC error is factored in. This is acceptable for a "battery low" warning but not for precise SoC estimation.
+
 ## Notes
 
 - **Why FQP30N06L is fine here**: Yes, it's a 30A/60V power MOSFET for a circuit drawing 50µA. But what matters is the guaranteed logic-level threshold (1–2V) — at 3.3V Vgs it's hard on with negligible Rds (35mΩ). Gate leakage is in the nanoamp range. The TO-220 package is physically large but electrically perfect.
-- **IRLZ44N is interchangeable**: Same pinout (G-D-S facing label), same logic-level threshold. Use whichever you grab first.
 - **ADC calibration**: The ESP32-S3 ADC has per-chip variation. For more accurate readings, use `esp_adc_cal` APIs with eFuse calibration data, or calibrate with a known reference voltage.
 - **Protection**: If there's risk of voltages exceeding 7V on the solar input (e.g., during load dump), add a 3.3V Zener diode from each ADC pin to GND as overvoltage protection.
 - **Measurement frequency**: A reading every 30–60 seconds during active mode is plenty. Each measurement takes <10ms total.
