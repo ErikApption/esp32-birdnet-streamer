@@ -99,10 +99,11 @@ def _build_device(entity_name: str) -> tuple[MQTTDevice, dict[str, MQTTSensorEnt
 
     # Stream statistics
     sensors["packets_received"] = MQTTSensorEntity(
-        name="Packets Received",
-        unique_id=f"{device_id}_packets_received",
-        state_topic=f"{state_topic}/packets_received",
-        state_class="total_increasing",
+        name="Packets Per Minute",
+        unique_id=f"{device_id}_packets_per_minute",
+        state_topic=f"{state_topic}/packets_per_minute",
+        unit_of_measurement="pkt/min",
+        state_class="measurement",
         icon="mdi:package-down",
     )
     sensors["stream_uptime"] = MQTTSensorEntity(
@@ -183,7 +184,7 @@ class MQTTHAIntegration:
             availability_topic=availability_topic,
             devs=[self._device],
             origin_name="birdnet-listener",
-            origin_url="https://github.com/your-repo/esp32-birdnet-streamer",
+            origin_url="https://github.com/ErikApption/esp32-birdnet-streamer",
         )
 
         await self._client.connect(
@@ -291,8 +292,13 @@ class MQTTHAIntegration:
             )
 
             # Stream stats
+            uptime_s = protocol.stream_uptime_seconds
+            if uptime_s > 0:
+                packets_per_minute = round(protocol.packets_received / uptime_s * 60)
+            else:
+                packets_per_minute = 0
             await self._sensors["packets_received"].send_state(
-                self._client, protocol.packets_received
+                self._client, packets_per_minute
             )
             await self._sensors["stream_uptime"].send_state(
                 self._client, int(protocol.stream_uptime_seconds)
