@@ -128,6 +128,7 @@ class UDPReceiverProtocol(asyncio.DatagramProtocol):
         opus_buffer: StreamBuffer | None = None,
         discovery_stop_event: threading.Event | None = None,
         on_telemetry: "Callable[[], None] | None" = None,
+        on_stream_state_changed: "Callable[[bool], None] | None" = None,
     ):
         self.audio_buffer = audio_buffer
         self.opus_buffer = opus_buffer
@@ -145,6 +146,7 @@ class UDPReceiverProtocol(asyncio.DatagramProtocol):
         self._log_task: asyncio.TimerHandle | None = None
         self._discovery_stop_event = discovery_stop_event
         self._on_telemetry = on_telemetry
+        self._on_stream_state_changed = on_stream_state_changed
 
         # Decoder is created lazily when first needed
         self._opus_decoder: opuslib.Decoder | None = None
@@ -244,6 +246,8 @@ class UDPReceiverProtocol(asyncio.DatagramProtocol):
                 logger.info("[UDP] Receiving audio stream")
                 self._receiving = True
                 self._stream_start_time = time.monotonic()
+                if self._on_stream_state_changed is not None:
+                    self._on_stream_state_changed(True)
             msg = (
                 f"[UDP] {self._packets_since_last_log} packets received "
                 f"({self._bytes_since_last_log / 1024:.1f} KB) in the last "
@@ -265,6 +269,8 @@ class UDPReceiverProtocol(asyncio.DatagramProtocol):
                 self._receiving = False
                 self._stream_start_time = 0.0
                 self._diag_total_interruptions += 1
+                if self._on_stream_state_changed is not None:
+                    self._on_stream_state_changed(False)
 
         self._packets_since_last_log = 0
         self._bytes_since_last_log = 0

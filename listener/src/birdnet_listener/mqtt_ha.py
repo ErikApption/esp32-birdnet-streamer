@@ -159,6 +159,7 @@ class MQTTHAIntegration:
         self._sensors: dict[str, MQTTSensorEntity | MQTTBinarySensorEntity] = {}
         self._udp_protocol = None
         self._loop: asyncio.AbstractEventLoop | None = None
+        self._availability_topic: str = ""
 
     async def start(self, udp_protocol_getter) -> None:
         """Start the MQTT client and register for telemetry callbacks.
@@ -176,6 +177,7 @@ class MQTTHAIntegration:
 
         device_id = "birdnet_streamer"
         availability_topic = f"{TOPIC_PREFIX}/{device_id}/availability"
+        self._availability_topic = availability_topic
 
         self._client = MQTTClient(
             availability_topic=availability_topic,
@@ -195,9 +197,14 @@ class MQTTHAIntegration:
         self._client.monitor_homeassistant_status()
         await self._client.publish_discovery_info()
 
+        # Publish device as offline initially — stream is not yet active
+        await self._client.publish_availability(
+            self._availability_topic, online=False, retain=True
+        )
+
         logger.info(
             f"[MQTT] Connected to {self.config.host}:{self.config.port}, "
-            f"publishing as '{self.config.entity_name}'"
+            f"publishing as '{self.config.entity_name}' (device offline until stream starts)"
         )
 
     def on_telemetry_received(self) -> None:
@@ -210,11 +217,49 @@ class MQTTHAIntegration:
             return
         self._loop.create_task(self._publish_telemetry())
 
+    def on_stream_state_changed(self, active: bool) -> None:
+        """Callback invoked when the UDP stream starts or stops.
+
+        Publishes the device availability to Home Assistant so the device
+        shows as connected only while the ESP32 is actively streaming.
+
+        This runs synchronously from the UDP protocol's timer callback,
+        so we schedule the async publish as a task.
+        """
+        if self._client is None or self._loop is None:
+            return
+        self._loop.create_task(self._publish_stream_availability(active))
+
     async def stop(self) -> None:
         """Stop the MQTT client."""
         if self._client:
+            # Publish offline before disconnecting so HA sees the state change
+            # even if the LWT doesn't fire immediately
+            if hasattr(self, "_availability_topic"):
+                await self._client.publish_availability(
+                    self._availability_topic, online=False, retain=True
+                )
             await self._client.disconnect()
             logger.info("[MQTT] Disconnected")
+
+    async def _publish_stream_availability(self, active: bool) -> None:
+        """Publish device availability based on UDP stream state."""
+        if self._client is None:
+            return
+        try:
+            await self._client.publish_availability(
+                self._availability_topic, online=active, retain=True
+            )
+            # When stream becomes active, immediately mark WiFi as connected
+            # rather than waiting for a telemetry packet
+            if active:
+                await self._sensors["esp_wifi_connected"].send_state(
+                    self._client, True
+                )
+            state = "online" if active else "offline"
+            logger.info(f"[MQTT] Device availability: {state}")
+        except Exception as e:
+            logger.error(f"[MQTT] Error publishing availability: {e}")
 
     async def _publish_telemetry(self) -> None:
         """Read current telemetry from the UDP protocol and publish to MQTT."""
