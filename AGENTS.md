@@ -6,6 +6,13 @@ Instructions for building, running, and validating the two components of this pr
 
 The firmware lives in `src/` and is built with [PlatformIO](https://platformio.org/).
 
+### Platform IO
+
+On windows, the system should attempt to execute it with
+```bash
+& "$env:USERPROFILE\.platformio\penv\Scripts\pio.exe" run 2>&1
+```
+
 ### Build
 
 ```bash

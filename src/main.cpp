@@ -183,6 +183,16 @@ unsigned long lastBurstTime = 0;     // timestamp of last burst send
 #define MDNS_HOSTNAME     "esp32-birdnet"
 #define MDNS_SERVICE      "birdnet"
 
+// ─── Status LED Configuration ────────────────────────────────────────────────
+// External red LED on a GPIO pin indicates system state at boot and during
+// operation. Uses the Blinkenlight library for non-blocking flash patterns.
+//   - One long flash at boot: WiFi connected via saved or compile-time credentials
+//   - Single flash every 5s:  Captive portal active (waiting for user config)
+//   - Double flash every 5s:  WiFi connection failed
+//   - Triple flash every 5s:  I2S microphone initialization failed
+//   - Off:                    System operating normally
+#define STATUS_LED_PIN        11   // GPIO for external red status LED
+
 // ─── Forward declarations ────────────────────────────────────────────────────
 void wifiInit();
 void otaInit();
@@ -210,6 +220,10 @@ void handleDiagStart();
 void handleDiagStop();
 void updateSignalLed();
 float readAdcVoltage(int pin);
+void statusLedInit();
+void statusLedBootFlash();
+void statusLedStartPattern(int flashes);
+void statusLedStop();
 
 // ─── Persistent Settings (NVS) ───────────────────────────────────────────────
 void loadSettings() {
@@ -753,6 +767,38 @@ void updateSignalLed() {
     opusFramesSilent = 0;
 }
 
+// ─── Status LED (Blinkenlight-driven flash patterns) ─────────────────────────
+#include <Fadinglight.h>
+
+Fadinglight statusLed(STATUS_LED_PIN);
+
+// Custom speed: 150ms on, 200ms off, 1000ms pause between groups, 5000ms ending
+static const SpeedSetting STATUS_LED_SPEED = {
+    .on_ms = 150,
+    .off_ms = 200,
+    .pause_ms = 1000,
+    .ending_ms = 5000,
+};
+
+void statusLedInit() {
+    statusLed.setSpeed(SPEED_FAST);
+}
+
+// One long flash (800ms) then off
+void statusLedBootFlash() {
+    statusLed.flash(800);
+}
+
+// Start a repeating flash pattern (1=portal, 2=wifi failed, 3=I2S failed)
+void statusLedStartPattern(int flashes) {
+    statusLed.pattern(flashes, true);
+}
+
+// Stop all LED activity
+void statusLedStop() {
+    statusLed.off();
+}
+
 // ─── I2S Setup ───────────────────────────────────────────────────────────────
 void i2sInit() {
     // Power up the INMP441 microphone from a GPIO pin
@@ -954,6 +1000,7 @@ void wifiInit() {
 
     if (WiFi.status() == WL_CONNECTED) {
         Serial.println("[WiFi] Connected via stored credentials (fast path)");
+        statusLedBootFlash();
     }
 
 #if defined(WIFI_SSID) && defined(WIFI_PASSWORD)
@@ -969,6 +1016,7 @@ void wifiInit() {
                 attempt + 1, maxAttempts, timeouts[attempt]);
 
             if (wifiTryConnect(WIFI_SSID, WIFI_PASSWORD, timeouts[attempt])) {
+                statusLedBootFlash();
                 break;
             }
 
@@ -1033,13 +1081,38 @@ void wifiInit() {
         wm.setConfigPortalTimeout(180);
         wm.setConnectTimeout(20);  // Allow 20 seconds for WiFi connection
 
-        bool connected = wm.autoConnect("BirdNet-Setup");
+        // Indicate captive portal is active via status LED (single flash every 5s)
+        statusLedStartPattern(1);
+
+        // Use non-blocking mode so the Ticker-driven LED keeps flashing
+        wm.setConfigPortalBlocking(false);
+        wm.autoConnect("BirdNet-Setup");
+
+        // Run the portal loop manually until WiFiManager finishes
+        bool connected = false;
+        while (true) {
+            if (wm.process()) {
+                connected = (WiFi.status() == WL_CONNECTED);
+                break;
+            }
+            statusLed.update();
+            delay(10);
+        }
 
         if (!connected) {
+            // Double flash = WiFi failed
+            statusLedStartPattern(2);
             Serial.println("[WiFi] All connection methods failed — restarting in 5s");
-            delay(5000);
+            unsigned long waitStart = millis();
+            while (millis() - waitStart < 5000) {
+                statusLed.update();
+                delay(10);
+            }
             ESP.restart();
         }
+
+        // Portal connected successfully — one long flash
+        statusLedBootFlash();
 
         // Only overwrite NVS values if WiFiManager portal was actually used
         if (strlen(customUdpHost.getValue()) > 0) {
@@ -1757,6 +1830,16 @@ void startStreaming() {
 
     Serial.println("[Schedule] Within active window — starting audio services");
     i2sInit();
+
+    // Check if I2S initialization failed (rx_handle remains NULL on failure)
+    if (rx_handle == NULL) {
+        Serial.println("[Boot] ERROR: I2S microphone init failed — signaling via LED");
+        statusLedStartPattern(3);  // Triple flash = I2S failure
+    } else {
+        // I2S OK — system fully operational, stop any LED pattern
+        statusLedStop();
+    }
+
     opusInit();
     udpInit();
 
@@ -1786,6 +1869,9 @@ void setup() {
 
     // Turn off the onboard RGB LED immediately — it may retain state across resets
     rgbLedWrite(RGB_BUILTIN, 0, 0, 0);
+
+    // Initialize the external status LED
+    statusLedInit();
 
     Serial.println("\n══════════════════════════════════════════════════");
     Serial.println("       ESP32 BirdNet Streamer — Booting");
@@ -1909,6 +1995,9 @@ void loop() {
             sendTelemetryPacket();
         }
     }
+
+    // Update status LED pattern (non-blocking, driven by Blinkenlight)
+    statusLed.update();
 
     delay(10); // Yield time — audio runs on its own task
 }

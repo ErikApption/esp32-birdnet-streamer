@@ -33,6 +33,32 @@ Most I2S MEMS microphones (INMP441, SPH0645, ICS-43434) have 6 pins. Connect the
 | SD      | Serial Data    | Red    | GPIO 6        | Audio data output from mic                                                  |
 | L/R     | Channel select | Green  | GND           | Tie to GND for left channel, 3.3V for right channel. Code defaults to left. |
 
+### Wiring the Status LED
+
+A standard red LED on GPIO 11 indicates system state during boot and operation.
+
+| LED Pin  | Connect to     | Notes                                                                 |
+| -------- | -------------- | --------------------------------------------------------------------- |
+| Anode (+)| GPIO 11        | Through a current-limiting resistor                                   |
+| Cathode (−)| GND          | Any GND pin on the ESP32-S3 DevKitC                                   |
+
+**Resistor selection:** Use a **330 Ω** resistor in series with the LED anode. This limits current to approximately 5 mA at 3.3V GPIO output (assuming a typical red LED forward voltage of 1.7V), which is bright enough to be visible without wasting power. A 220 Ω resistor also works if you want slightly brighter output (~7 mA).
+
+```
+ESP32-S3 GPIO 11 ───[ 330Ω ]───►|─── GND
+                              (red LED)
+```
+
+#### LED flash patterns
+
+| Pattern                      | Meaning                                                    |
+| ---------------------------- | ---------------------------------------------------------- |
+| One long flash (800 ms)     | Boot success — WiFi connected via saved or compile-time credentials |
+| Single flash every 5 s       | Captive portal active — waiting for WiFi configuration     |
+| Double flash every 5 s       | WiFi connection failed (device will reboot)                |
+| Triple flash every 5 s       | I2S microphone initialization failed                       |
+| Off                          | System operating normally                                  |
+
 #### Wiring diagram (text)
 
 ```
@@ -44,6 +70,10 @@ GPIO 4 ───────────────────────  SC
 GPIO 5 ───────────────────────  WS
 GPIO 6 ───────────────────────  SD
 GND   ────────────────────────  L/R  ← left channel
+
+                              Status LED
+                              ──────────
+GPIO 11 ──[ 330Ω ]──►|──────  GND  (red LED, anode to resistor)
 ```
 
 #### Tips
@@ -67,6 +97,7 @@ All ESP32-S3 GPIOs used in this project, including the I2S microphone and the ba
 | 8    | VBAT_SENSE        | ADC INPUT  | Power Monitor    | Battery voltage via divider (ADC1_CH7, 11dB atten)           |
 | 9    | VSOL_SENSE        | ADC INPUT  | Power Monitor    | Solar panel voltage via divider (ADC1_CH8, 11dB atten)       |
 | 10   | MIC_POWER         | OUTPUT     | I2S Microphone   | Powers INMP441 VDD (~1.4 mA, software-controlled)            |
+| 11   | STATUS_LED        | OUTPUT     | Status LED       | Red LED via 330Ω resistor — boot/error flash patterns        |
 
 
 #### Pin selection rationale
@@ -75,6 +106,7 @@ All ESP32-S3 GPIOs used in this project, including the I2S microphone and the ba
 - **GPIO 7** — MOSFET gate for the zero-quiescent-current power monitor switch. Held LOW during deep sleep by 10kΩ pull-down resistor; no RTC config needed.
 - **GPIOs 8–9** — ADC1 channels (CH7, CH8). ADC1 remains usable when WiFi is active (ADC2 is not). 11dB attenuation gives 0–3.1V input range.
 - **GPIO 10** — Mic power. Allows software power-cycling of the INMP441 and draws zero current during deep sleep (pin goes Hi-Z).
+- **GPIO 11** — Status LED. General-purpose output driving a red LED through a 330Ω resistor. Draws ~5 mA only while flashing; off during normal operation and deep sleep.
 - All selected pins are general-purpose on the ESP32-S3-DevKitC-1 (N16R8) with no conflicting boot-strapping or flash functions.
 
 ## Power Setup

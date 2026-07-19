@@ -105,7 +105,7 @@ class UDPReceiverProtocol(asyncio.DatagramProtocol):
 
     # Solar voltage threshold — above this, the charge module is likely active
     # and the battery sense reading includes charger output voltage, not true SoC.
-    VSOL_CHARGING_THRESHOLD = 1.0  # Volts (panel producing meaningful power)
+    VSOL_CHARGING_THRESHOLD = 4.0  # Volts (panel producing meaningful power)
 
     # Audio level thresholds for silence/quiet detection (16-bit PCM)
     SILENCE_THRESHOLD = 50         # peak below this = digital silence (dead mic / DTX)
