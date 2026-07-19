@@ -98,6 +98,7 @@ def create_app(
                 opus_buffer=opus_buffer,
                 discovery_stop_event=discovery_stop_event,
                 on_telemetry=mqtt_integration.on_telemetry_received if mqtt_integration else None,
+                on_stream_state_changed=mqtt_integration.on_stream_state_changed if mqtt_integration else None,
             ),
             local_addr=("0.0.0.0", udp_port),
             family=socket.AF_INET,
