@@ -6,11 +6,12 @@
 #include <WebServer.h>
 #include <ESPmDNS.h>
 #include <Preferences.h>
-#include <driver/i2s_std.h>
+#include <driver/i2s.h>
 #include <time.h>
 #include <sunset.h>
 #include <esp_system.h>
 #include <opus.h>
+#include <lwip/inet.h>  // htons, htonl for network byte order
 
 // Onboard LED
 #ifndef RGB_BUILTIN
@@ -70,11 +71,28 @@
 #define POWER_READ_INTERVAL_MS  (60 * 1000)  // Read every 60 seconds
 
 // Telemetry trailer: appended to audio packets (no separate telemetry socket needed)
-// Format: magic "TL" (2 bytes) + telemetry payload (20 bytes) = 22 bytes total
+// Format: magic "TL" (2 bytes) + telemetry payload (24 bytes) = 26 bytes total
 // Attached to the last audio packet in each burst when telemetry data is fresh.
 #define TELEMETRY_MAGIC_0   0x54  // 'T'
 #define TELEMETRY_MAGIC_1   0x4C  // 'L'
-#define TELEMETRY_TRAILER_SIZE 22  // 2 magic + 2 bat + 2 sol + 2 rssi + 4 sent + 4 errors + 4 dropped + 1 wifi + 1 consec_fails
+
+// Packed struct representing the on-wire telemetry trailer (big-endian fields).
+// Use htons/htonl when writing multi-byte values.
+struct __attribute__((packed)) TelemetryTrailer {
+    uint8_t  magic[2];        // 'T', 'L'
+    uint16_t bat_adc_mv;      // battery ADC millivolts (network byte order)
+    uint16_t sol_adc_mv;      // solar ADC millivolts (network byte order)
+    int16_t  rssi;            // WiFi RSSI dBm (network byte order)
+    uint32_t udp_sent;        // total packets sent (network byte order)
+    uint32_t udp_errors;      // total send errors (network byte order)
+    uint32_t udp_dropped;     // packets dropped (network byte order)
+    uint8_t  wifi_connected;  // 1=connected, 0=disconnected
+    uint8_t  consec_fails;    // consecutive send failures (capped 255)
+    uint32_t sleep_seconds;   // 0=awake, >0=going to sleep for N seconds (network byte order)
+};
+
+static_assert(sizeof(TelemetryTrailer) == 26, "TelemetryTrailer must be 26 bytes");
+#define TELEMETRY_TRAILER_SIZE sizeof(TelemetryTrailer)
 
 // ─── HTTP Config Server ──────────────────────────────────────────────────────
 #define HTTP_PORT         80
@@ -128,7 +146,8 @@ unsigned long lastPowerReadTime = 0;
 // Telemetry is assembled in loop() on core 0, then attached to the next audio
 // burst by the audioTask on core 1. A volatile flag signals fresh data.
 volatile bool telemetryPending = false;
-uint8_t telemetryTrailer[TELEMETRY_TRAILER_SIZE];  // pre-built trailer bytes
+TelemetryTrailer telemetryTrailer;  // pre-built trailer struct
+volatile uint32_t pendingSleepSeconds = 0;  // non-zero when device is about to enter deep sleep
 
 // ─── UDP Target (used by streaming) ──────────────────────────────────────────
 IPAddress resolvedUdpAddr;
@@ -149,7 +168,7 @@ bool configured     = false;  // true once a config has been received (persisted
 
 static int32_t i2sReadBuffer[DMA_BUF_LEN];  // 32-bit I2S read buffer
 static int16_t i2sBuffer[DMA_BUF_LEN];     // 16-bit samples after bit-shift conversion
-static i2s_chan_handle_t rx_handle = NULL;  // New I2S driver channel handle
+static bool i2s_initialized = false;  // Legacy I2S driver init flag
 
 // ─── Opus Encoder Globals ────────────────────────────────────────────────────
 OpusEncoder *opusEncoder = nullptr;
@@ -634,38 +653,18 @@ void readPowerMonitor() {
 void sendTelemetryPacket() {
     if (resolvedUdpAddr == IPAddress(0, 0, 0, 0)) return;
 
-    // Build telemetry trailer bytes (will be appended to the next audio burst packet)
-    uint16_t batMv = (uint16_t)(lastBatteryVoltage * 1000.0f);
-    uint16_t solMv = (uint16_t)(lastSolarVoltage * 1000.0f);
-    int16_t rssi = (int16_t)WiFi.RSSI();
-    uint32_t sent = (uint32_t)udpSendSuccess;
-    uint32_t errors = (uint32_t)udpSendErrors;
-    uint32_t dropped = (uint32_t)udpPacketsDropped;
-    uint8_t wifiStatus = (WiFi.status() == WL_CONNECTED) ? 1 : 0;
-    uint8_t consecFails = (uint8_t)min(udpConsecutiveFails, (unsigned long)255);
-
-    telemetryTrailer[0] = TELEMETRY_MAGIC_0;       // 'T'
-    telemetryTrailer[1] = TELEMETRY_MAGIC_1;       // 'L'
-    telemetryTrailer[2] = (uint8_t)(batMv >> 8);   // battery ADC mV big-endian
-    telemetryTrailer[3] = (uint8_t)(batMv & 0xFF);
-    telemetryTrailer[4] = (uint8_t)(solMv >> 8);   // solar ADC mV big-endian
-    telemetryTrailer[5] = (uint8_t)(solMv & 0xFF);
-    telemetryTrailer[6] = (uint8_t)(rssi >> 8);    // RSSI int16 big-endian
-    telemetryTrailer[7] = (uint8_t)(rssi & 0xFF);
-    telemetryTrailer[8]  = (uint8_t)(sent >> 24);  // UDP sent uint32 big-endian
-    telemetryTrailer[9]  = (uint8_t)(sent >> 16);
-    telemetryTrailer[10] = (uint8_t)(sent >> 8);
-    telemetryTrailer[11] = (uint8_t)(sent & 0xFF);
-    telemetryTrailer[12] = (uint8_t)(errors >> 24); // UDP errors uint32 big-endian
-    telemetryTrailer[13] = (uint8_t)(errors >> 16);
-    telemetryTrailer[14] = (uint8_t)(errors >> 8);
-    telemetryTrailer[15] = (uint8_t)(errors & 0xFF);
-    telemetryTrailer[16] = (uint8_t)(dropped >> 24); // UDP dropped uint32 big-endian
-    telemetryTrailer[17] = (uint8_t)(dropped >> 16);
-    telemetryTrailer[18] = (uint8_t)(dropped >> 8);
-    telemetryTrailer[19] = (uint8_t)(dropped & 0xFF);
-    telemetryTrailer[20] = wifiStatus;              // 1=connected, 0=disconnected
-    telemetryTrailer[21] = consecFails;             // consecutive send failures (capped 255)
+    // Build telemetry trailer struct (will be appended to the next audio burst packet)
+    telemetryTrailer.magic[0] = TELEMETRY_MAGIC_0;
+    telemetryTrailer.magic[1] = TELEMETRY_MAGIC_1;
+    telemetryTrailer.bat_adc_mv     = htons((uint16_t)(lastBatteryVoltage * 1000.0f));
+    telemetryTrailer.sol_adc_mv     = htons((uint16_t)(lastSolarVoltage * 1000.0f));
+    telemetryTrailer.rssi           = (int16_t)htons((uint16_t)(int16_t)WiFi.RSSI());
+    telemetryTrailer.udp_sent       = htonl((uint32_t)udpSendSuccess);
+    telemetryTrailer.udp_errors     = htonl((uint32_t)udpSendErrors);
+    telemetryTrailer.udp_dropped    = htonl((uint32_t)udpPacketsDropped);
+    telemetryTrailer.wifi_connected = (WiFi.status() == WL_CONNECTED) ? 1 : 0;
+    telemetryTrailer.consec_fails   = (uint8_t)min(udpConsecutiveFails, (unsigned long)255);
+    telemetryTrailer.sleep_seconds  = htonl((uint32_t)pendingSleepSeconds);
 
     // Signal the audio task to attach this trailer to the next burst
     telemetryPending = true;
@@ -688,7 +687,7 @@ void handleDiagStop() {
     // Restore voltage monitor pin to LOW (normal idle state)
     digitalWrite(MONITOR_EN_PIN, LOW);
     // Turn off the LED to save power
-    rgbLedWrite(RGB_BUILTIN, 0, 0, 0);
+    neopixelWrite(RGB_BUILTIN, 0, 0, 0);
     Serial.println("[Diag] Diagnostic mode STOPPED — MONITOR_EN_PIN LOW, LED off");
     server.send(200, "application/json", "{\"diagnostic\":\"stopped\",\"monitor_pin\":\"LOW\",\"led\":\"disabled\"}");
 }
@@ -755,9 +754,9 @@ void updateSignalLed() {
 
     // Apply LED color based on latched state
     switch (latchedState) {
-        case 2:  rgbLedWrite(RGB_BUILTIN, 20, 0, 0);   break;  // Red
-        case 1:  rgbLedWrite(RGB_BUILTIN, 20, 15, 0);  break;  // Yellow
-        default: rgbLedWrite(RGB_BUILTIN, 0, 20, 0);   break;  // Green
+        case 2:  neopixelWrite(RGB_BUILTIN, 20, 0, 0);   break;  // Red
+        case 1:  neopixelWrite(RGB_BUILTIN, 20, 15, 0);  break;  // Yellow
+        default: neopixelWrite(RGB_BUILTIN, 0, 20, 0);   break;  // Green
     }
 
     // Reset counters for the next window
@@ -806,50 +805,43 @@ void i2sInit() {
     digitalWrite(MIC_POWER_PIN, HIGH);
     delay(100);  // Allow mic to stabilize after power-on
 
-    // Create RX channel
-    i2s_chan_config_t chan_cfg = I2S_CHANNEL_DEFAULT_CONFIG(I2S_NUM_0, I2S_ROLE_MASTER);
-    chan_cfg.dma_desc_num = DMA_BUF_COUNT;
-    chan_cfg.dma_frame_num = DMA_BUF_LEN;
-
-    esp_err_t err = i2s_new_channel(&chan_cfg, NULL, &rx_handle);
-    if (err != ESP_OK) {
-        Serial.printf("[I2S] Channel creation failed: %d\n", err);
-        return;
-    }
-
-    // Configure standard mode for INMP441 (Philips/I2S format, 32-bit, mono left)
-    i2s_std_config_t std_cfg = {
-        .clk_cfg = I2S_STD_CLK_DEFAULT_CONFIG(sampleRate),
-        .slot_cfg = I2S_STD_PHILIPS_SLOT_DEFAULT_CONFIG(I2S_DATA_BIT_WIDTH_32BIT, I2S_SLOT_MODE_MONO),
-        .gpio_cfg = {
-            .mclk = I2S_GPIO_UNUSED,
-            .bclk = (gpio_num_t)I2S_SCK_PIN,
-            .ws = (gpio_num_t)I2S_WS_PIN,
-            .dout = I2S_GPIO_UNUSED,
-            .din = (gpio_num_t)I2S_SD_PIN,
-            .invert_flags = {
-                .mclk_inv = false,
-                .bclk_inv = false,
-                .ws_inv = false,
-            },
-        },
+    // Legacy I2S driver configuration for INMP441 (Philips/I2S, 32-bit, mono)
+    i2s_config_t i2s_config = {
+        .mode = (i2s_mode_t)(I2S_MODE_MASTER | I2S_MODE_RX),
+        .sample_rate = sampleRate,
+        .bits_per_sample = I2S_BITS_PER_SAMPLE_32BIT,
+        .channel_format = I2S_CHANNEL_FMT_ONLY_LEFT,
+        .communication_format = I2S_COMM_FORMAT_STAND_I2S,
+        .intr_alloc_flags = ESP_INTR_FLAG_LEVEL1,
+        .dma_buf_count = DMA_BUF_COUNT,
+        .dma_buf_len = DMA_BUF_LEN,
+        .use_apll = false,
+        .tx_desc_auto_clear = false,
+        .fixed_mclk = 0,
     };
-    // INMP441 outputs on the left channel when WS is low
-    std_cfg.slot_cfg.slot_mask = I2S_STD_SLOT_LEFT;
 
-    err = i2s_channel_init_std_mode(rx_handle, &std_cfg);
+    i2s_pin_config_t pin_config = {
+        .bck_io_num = I2S_SCK_PIN,
+        .ws_io_num = I2S_WS_PIN,
+        .data_out_num = I2S_PIN_NO_CHANGE,
+        .data_in_num = I2S_SD_PIN,
+    };
+
+    esp_err_t err = i2s_driver_install(I2S_NUM_0, &i2s_config, 0, NULL);
     if (err != ESP_OK) {
-        Serial.printf("[I2S] Std mode init failed: %d\n", err);
+        Serial.printf("[I2S] Driver install failed: %d\n", err);
         return;
     }
 
-    err = i2s_channel_enable(rx_handle);
+    err = i2s_set_pin(I2S_NUM_0, &pin_config);
     if (err != ESP_OK) {
-        Serial.printf("[I2S] Channel enable failed: %d\n", err);
+        Serial.printf("[I2S] Set pin failed: %d\n", err);
+        i2s_driver_uninstall(I2S_NUM_0);
         return;
     }
 
-    Serial.println("[I2S] Initialized (new driver)");
+    i2s_initialized = true;
+    Serial.println("[I2S] Initialized (legacy driver)");
 }
 
 // ─── Opus Encoder Setup ──────────────────────────────────────────────────────
@@ -1361,6 +1353,22 @@ void enterDeepSleep(uint64_t sleepSeconds) {
     Serial.printf("[Sleep] Entering deep sleep for %llu seconds (%.1f hours)\n",
         sleepSeconds, sleepSeconds / 3600.0);
 
+    // Send a final telemetry packet indicating we're going to sleep and for how long
+    pendingSleepSeconds = (uint32_t)sleepSeconds;
+    readPowerMonitor();
+    sendTelemetryPacket();
+
+    // Send the telemetry trailer as a standalone UDP packet so the listener
+    // receives it even if no audio burst is pending.
+    if (resolvedUdpAddr != IPAddress(0, 0, 0, 0)) {
+        uint16_t port = (uint16_t)atoi(udpPort);
+        udp.beginPacket(resolvedUdpAddr, port);
+        udp.write((const uint8_t*)&telemetryTrailer, TELEMETRY_TRAILER_SIZE);
+        udp.endPacket();
+        delay(50);  // Give the WiFi stack time to flush the packet
+        Serial.println("[Sleep] Final telemetry packet sent (sleep announcement)");
+    }
+
     // Ensure microphone is powered down before sleeping
     digitalWrite(MIC_POWER_PIN, LOW);
 
@@ -1400,7 +1408,7 @@ void udpInit() {
 void streamAudio() {
     size_t bytesRead = 0;
 
-    esp_err_t err = i2s_channel_read(rx_handle, i2sReadBuffer, sizeof(i2sReadBuffer), &bytesRead, portMAX_DELAY);
+    esp_err_t err = i2s_read(I2S_NUM_0, i2sReadBuffer, sizeof(i2sReadBuffer), &bytesRead, portMAX_DELAY);
     if (err != ESP_OK || bytesRead == 0) {
         return;
     }
@@ -1695,7 +1703,7 @@ void burstSendPackets() {
 
             // Append telemetry trailer to the last packet in the burst
             if (isLastPacket && attachTelemetry) {
-                udp.write(telemetryTrailer, TELEMETRY_TRAILER_SIZE);
+                udp.write((const uint8_t*)&telemetryTrailer, TELEMETRY_TRAILER_SIZE);
             }
 
             if (udp.endPacket()) {
@@ -1831,8 +1839,8 @@ void startStreaming() {
     Serial.println("[Schedule] Within active window — starting audio services");
     i2sInit();
 
-    // Check if I2S initialization failed (rx_handle remains NULL on failure)
-    if (rx_handle == NULL) {
+    // Check if I2S initialization failed
+    if (!i2s_initialized) {
         Serial.println("[Boot] ERROR: I2S microphone init failed — signaling via LED");
         statusLedStartPattern(3);  // Triple flash = I2S failure
     } else {
@@ -1868,7 +1876,7 @@ void setup() {
     delay(1000);
 
     // Turn off the onboard RGB LED immediately — it may retain state across resets
-    rgbLedWrite(RGB_BUILTIN, 0, 0, 0);
+    neopixelWrite(RGB_BUILTIN, 0, 0, 0);
 
     // Initialize the external status LED
     statusLedInit();

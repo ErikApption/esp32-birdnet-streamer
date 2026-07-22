@@ -87,7 +87,7 @@ class UDPReceiverProtocol(asyncio.DatagramProtocol):
     PACKET_MAGIC = b"OP"
     TELEMETRY_MAGIC = b"TL"
     HEADER_SIZE = 4  # 2 bytes magic + 1 byte frame_count + 1 byte sequence_number
-    TELEMETRY_TRAILER_SIZE = 22  # 2 magic + 2 bat_adc_mV + 2 sol_adc_mV + 2 rssi + 4 sent + 4 errors + 4 dropped + 1 wifi + 1 consec_fails
+    TELEMETRY_TRAILER_SIZE = 26  # 2 magic + 2 bat_adc_mV + 2 sol_adc_mV + 2 rssi + 4 sent + 4 errors + 4 dropped + 1 wifi + 1 consec_fails + 4 sleep_seconds
     FRAME_SIZE = 2880  # 60ms at 48kHz mono (samples per frame)
     LARGE_GAP_THRESHOLD = 128  # gaps larger than this are treated as reordering
 
@@ -166,6 +166,7 @@ class UDPReceiverProtocol(asyncio.DatagramProtocol):
         self.esp_udp_dropped: int = 0           # packets dropped due to ring overflow
         self.esp_wifi_connected: bool = False    # ESP32 WiFi link status
         self.esp_consecutive_fails: int = 0     # current failure streak
+        self.esp_sleep_seconds: int = 0         # 0 = awake; >0 = going to sleep for N seconds
 
         # ─── Audio diagnostics state (per log interval) ──────────────────
         self._diag_frames_decoded: int = 0       # Opus frames successfully decoded
@@ -649,7 +650,7 @@ class UDPReceiverProtocol(asyncio.DatagramProtocol):
                         logger.warning("[UDP] Suppressing further Opus decode errors")
 
         # ─── Check for telemetry trailer after opus frames ────────────────
-        # The ESP32 appends a 22-byte telemetry trailer (starting with "TL" magic)
+        # The ESP32 appends a 26-byte telemetry trailer (starting with "TL" magic)
         # to the last audio packet in each burst when telemetry data is fresh.
         remaining = payload[offset:]
         if len(remaining) >= self.TELEMETRY_TRAILER_SIZE and remaining[0:2] == self.TELEMETRY_MAGIC:
@@ -658,15 +659,23 @@ class UDPReceiverProtocol(asyncio.DatagramProtocol):
     def _parse_telemetry_payload(self, data: bytes) -> None:
         """Parse telemetry payload bytes (after the 'TL' magic has been stripped).
 
-        Supports both the minimal 4-byte payload (bat + sol) and the full 20-byte
-        extended payload (bat + sol + rssi + sent + errors + dropped + wifi + consec).
+        Wire format (big-endian):
+            Offset  Size  Field
+            0       2     bat_adc_mv   (uint16)
+            2       2     sol_adc_mv   (uint16)
+            4       2     rssi         (int16)
+            6       4     udp_sent     (uint32)
+            10      4     udp_errors   (uint32)
+            14      4     udp_dropped  (uint32)
+            18      1     wifi_connected (uint8)
+            19      1     consec_fails   (uint8)
+            20      4     sleep_seconds  (uint32)
         """
         if len(data) < 4:
             return
 
-        # Raw ADC millivolts from ESP32
-        bat_adc_mv = int.from_bytes(data[0:2], "big")
-        sol_adc_mv = int.from_bytes(data[2:4], "big")
+        # Unpack the minimal fields (battery + solar ADC millivolts)
+        bat_adc_mv, sol_adc_mv = struct.unpack_from("!HH", data, 0)
 
         # Apply divider ratios to recover actual voltages
         self.battery_voltage = (bat_adc_mv / 1000.0) * self.VBAT_DIVIDER_RATIO
@@ -690,12 +699,16 @@ class UDPReceiverProtocol(asyncio.DatagramProtocol):
 
         # ─── Parse extended UDP stats if present (20 bytes total payload) ─
         if len(data) >= 20:
-            self.esp_rssi = int.from_bytes(data[4:6], "big", signed=True)
-            self.esp_udp_sent = int.from_bytes(data[6:10], "big")
-            self.esp_udp_errors = int.from_bytes(data[10:14], "big")
-            self.esp_udp_dropped = int.from_bytes(data[14:18], "big")
-            self.esp_wifi_connected = data[18] == 1
-            self.esp_consecutive_fails = data[19]
+            (self.esp_rssi, self.esp_udp_sent, self.esp_udp_errors,
+             self.esp_udp_dropped, wifi_byte, self.esp_consecutive_fails
+            ) = struct.unpack_from("!hIIIBB", data, 4)
+            self.esp_wifi_connected = wifi_byte == 1
+
+        # ─── Parse sleep announcement if present (24 bytes total payload) ─
+        if len(data) >= 24:
+            (self.esp_sleep_seconds,) = struct.unpack_from("!I", data, 20)
+        else:
+            self.esp_sleep_seconds = 0
 
         self._telemetry_received += 1
         if self._telemetry_received <= 3 or self._telemetry_received % 60 == 0:
@@ -716,6 +729,9 @@ class UDPReceiverProtocol(asyncio.DatagramProtocol):
                 )
                 if self.esp_consecutive_fails > 0:
                     log_msg += f" (failing: {self.esp_consecutive_fails}x)"
+            if self.esp_sleep_seconds > 0:
+                hours = self.esp_sleep_seconds / 3600.0
+                log_msg += f" | SLEEPING for {self.esp_sleep_seconds}s ({hours:.1f}h)"
             logger.info(log_msg)
 
         # Notify telemetry callback (e.g., MQTT publisher)

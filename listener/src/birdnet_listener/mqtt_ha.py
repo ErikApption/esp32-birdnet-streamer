@@ -11,6 +11,7 @@ rather than on a fixed polling interval.
 
 import asyncio
 import logging
+import time
 from dataclasses import dataclass
 
 from mqtt_entity import MQTTClient, MQTTDevice, MQTTSensorEntity, MQTTBinarySensorEntity
@@ -134,6 +135,22 @@ def _build_device(entity_name: str) -> tuple[MQTTDevice, dict[str, MQTTSensorEnt
         entity_category="diagnostic",
     )
 
+    sensors["esp_sleeping"] = MQTTBinarySensorEntity(
+        name="Sleeping",
+        unique_id=f"{device_id}_sleeping",
+        state_topic=f"{state_topic}/esp_sleeping",
+        icon="mdi:sleep",
+    )
+    sensors["esp_sleep_duration"] = MQTTSensorEntity(
+        name="Sleep Remaining",
+        unique_id=f"{device_id}_sleep_duration",
+        state_topic=f"{state_topic}/esp_sleep_duration",
+        device_class="duration",
+        unit_of_measurement="s",
+        state_class="measurement",
+        icon="mdi:timer-sand",
+    )
+
     device = MQTTDevice(
         identifiers=[device_id],
         components=sensors,
@@ -161,6 +178,10 @@ class MQTTHAIntegration:
         self._udp_protocol = None
         self._loop: asyncio.AbstractEventLoop | None = None
         self._availability_topic: str = ""
+        # Sleep countdown tracking
+        self._sleep_start_time: float = 0.0   # monotonic timestamp when sleep was announced
+        self._sleep_total_seconds: int = 0    # total sleep duration announced by ESP32
+        self._sleep_countdown_task: asyncio.Task | None = None
 
     async def start(self, udp_protocol_getter) -> None:
         """Start the MQTT client and register for telemetry callbacks.
@@ -244,10 +265,25 @@ class MQTTHAIntegration:
             logger.info("[MQTT] Disconnected")
 
     async def _publish_stream_availability(self, active: bool) -> None:
-        """Publish device availability based on UDP stream state."""
+        """Publish device availability based on UDP stream state.
+
+        When the device has announced it is going to sleep (esp_sleep_seconds > 0),
+        we keep it marked as online/available so Home Assistant doesn't show it as
+        unavailable during its scheduled sleep window.
+        """
         if self._client is None:
             return
         try:
+            # If the stream stopped but the device announced sleep, stay online
+            if not active:
+                protocol = self._udp_protocol_getter()
+                if protocol is not None and protocol.esp_sleep_seconds > 0:
+                    logger.info(
+                        f"[MQTT] Stream stopped but device is sleeping "
+                        f"({protocol.esp_sleep_seconds}s) — keeping available"
+                    )
+                    return
+
             await self._client.publish_availability(
                 self._availability_topic, online=active, retain=True
             )
@@ -257,6 +293,8 @@ class MQTTHAIntegration:
                 await self._sensors["esp_wifi_connected"].send_state(
                     self._client, True
                 )
+                # Device woke up — clear sleep tracking state
+                self._clear_sleep_state()
             state = "online" if active else "offline"
             logger.info(f"[MQTT] Device availability: {state}")
         except Exception as e:
@@ -311,5 +349,69 @@ class MQTTHAIntegration:
             await self._sensors["esp_udp_dropped"].send_state(
                 self._client, protocol.esp_udp_dropped
             )
+
+            # Sleep state
+            is_sleeping = protocol.esp_sleep_seconds > 0
+            await self._sensors["esp_sleeping"].send_state(
+                self._client, is_sleeping
+            )
+
+            if is_sleeping and self._sleep_total_seconds == 0:
+                # New sleep announcement — start tracking countdown
+                self._sleep_start_time = time.monotonic()
+                self._sleep_total_seconds = protocol.esp_sleep_seconds
+                self._start_sleep_countdown()
+
+            remaining = self._sleep_remaining_seconds()
+            await self._sensors["esp_sleep_duration"].send_state(
+                self._client, remaining
+            )
         except Exception as e:
             logger.error(f"[MQTT] Error publishing telemetry: {e}")
+
+    def _sleep_remaining_seconds(self) -> int:
+        """Calculate how many seconds remain in the current sleep window."""
+        if self._sleep_total_seconds == 0:
+            return 0
+        elapsed = time.monotonic() - self._sleep_start_time
+        remaining = self._sleep_total_seconds - int(elapsed)
+        return max(0, remaining)
+
+    def _clear_sleep_state(self) -> None:
+        """Reset sleep tracking (called when device wakes up)."""
+        self._sleep_start_time = 0.0
+        self._sleep_total_seconds = 0
+        if self._sleep_countdown_task is not None:
+            self._sleep_countdown_task.cancel()
+            self._sleep_countdown_task = None
+
+    def _start_sleep_countdown(self) -> None:
+        """Start a background task that periodically publishes the remaining sleep time."""
+        if self._sleep_countdown_task is not None:
+            self._sleep_countdown_task.cancel()
+        if self._loop is not None:
+            self._sleep_countdown_task = self._loop.create_task(self._sleep_countdown_loop())
+
+    async def _sleep_countdown_loop(self) -> None:
+        """Publish sleep remaining time every 60s until the countdown expires."""
+        try:
+            while self._sleep_total_seconds > 0:
+                await asyncio.sleep(60)
+                remaining = self._sleep_remaining_seconds()
+                if self._client is None:
+                    break
+                is_sleeping = remaining > 0
+                await self._sensors["esp_sleeping"].send_state(
+                    self._client, is_sleeping
+                )
+                await self._sensors["esp_sleep_duration"].send_state(
+                    self._client, remaining
+                )
+                if remaining <= 0:
+                    # Countdown finished — device should be waking up
+                    self._sleep_total_seconds = 0
+                    break
+        except asyncio.CancelledError:
+            pass
+        except Exception as e:
+            logger.error(f"[MQTT] Error in sleep countdown: {e}")
