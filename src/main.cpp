@@ -767,9 +767,9 @@ void updateSignalLed() {
 }
 
 // ─── Status LED (Blinkenlight-driven flash patterns) ─────────────────────────
-#include <Fadinglight.h>
+#include <Blinkenlight.h>
 
-Fadinglight statusLed(STATUS_LED_PIN);
+Blinkenlight statusLed(STATUS_LED_PIN);
 
 // Custom speed: 150ms on, 200ms off, 1000ms pause between groups, 5000ms ending
 static const SpeedSetting STATUS_LED_SPEED = {
@@ -1872,6 +1872,7 @@ void startStreaming() {
 }
 
 void setup() {
+    WRITE_PERI_REG(RTC_CNTL_BROWN_OUT_REG, 0); // Disable brownout detector    
     Serial.begin(115200);
     delay(1000);
 
