@@ -210,6 +210,7 @@ void streamAudio();
 void enterDeepSleep(uint64_t sleepSeconds);
 bool isWithinActiveWindow();
 void syncTime();
+void resyncTime();
 void loadSettings();
 void saveSettings();
 void getSunTimes(int year, int month, int day, double &sunriseMin, double &sunsetMin);
@@ -1214,6 +1215,36 @@ void syncTime() {
         timeinfo.tm_isdst > 0 ? "yes" : "no");
 }
 
+// ─── Periodic NTP Re-sync (non-blocking, won't restart on failure) ───────────
+void resyncTime() {
+    Serial.println("[NTP] Periodic re-sync...");
+
+    // configTzTime triggers a fresh NTP request under the hood
+    int offset = atoi(utcOffset);
+    int posixStdOffset = -offset;
+    int posixDstOffset = posixStdOffset - 1;
+    char tzStr[64];
+    snprintf(tzStr, sizeof(tzStr), "STD%dDST%d,M3.2.0/2,M11.1.0/2",
+             posixStdOffset, posixDstOffset);
+    configTzTime(tzStr, NTP_SERVER);
+
+    // Wait briefly for the sync to complete (non-blocking: cap at 5s)
+    struct tm timeinfo;
+    int retries = 0;
+    while (!getLocalTime(&timeinfo) && retries < 10) {
+        delay(500);
+        retries++;
+    }
+
+    if (retries >= 10) {
+        Serial.println("[NTP] Re-sync failed — will retry next interval");
+    } else {
+        Serial.printf("[NTP] Re-synced: %04d-%02d-%02d %02d:%02d:%02d\n",
+            timeinfo.tm_year + 1900, timeinfo.tm_mon + 1, timeinfo.tm_mday,
+            timeinfo.tm_hour, timeinfo.tm_min, timeinfo.tm_sec);
+    }
+}
+
 // ─── Sunrise/Sunset Calculation ──────────────────────────────────────────────
 void getSunTimes(int year, int month, int day, double &sunriseMin, double &sunsetMin) {
     double lat = atof(latitude);
@@ -1360,6 +1391,10 @@ void enterDeepSleep(uint64_t sleepSeconds) {
 
     Serial.printf("[Sleep] Entering deep sleep for %llu seconds (%.1f hours)\n",
         sleepSeconds, sleepSeconds / 3600.0);
+
+    // Re-sync NTP before sleeping so the wake-up schedule calculation
+    // on the next boot starts from an accurate clock baseline
+    resyncTime();
 
     // Ensure microphone is powered down before sleeping
     digitalWrite(MIC_POWER_PIN, LOW);
@@ -1793,10 +1828,12 @@ void burstSendPackets() {
 #define SCHEDULE_CHECK_INTERVAL_MS  (5 * 60 * 1000)
 #define MDNS_ANNOUNCE_INTERVAL_MS   (120 * 1000)  // Re-advertise mDNS every 2 minutes
 #define WIFI_CHECK_INTERVAL_MS      (30 * 1000)   // Check WiFi connectivity every 30s
+#define NTP_RESYNC_INTERVAL_MS      (6UL * 60 * 60 * 1000)  // Re-sync NTP every 6 hours
 #define WIFI_RECONNECT_MAX_ATTEMPTS 5             // Max reconnect attempts before reboot
 unsigned long lastScheduleCheck = 0;
 unsigned long lastMdnsAnnounce = 0;
 unsigned long lastWifiCheck = 0;
+unsigned long lastNtpSync = 0;
 int wifiReconnectAttempts = 0;
 bool streamingStarted = false;
 TaskHandle_t audioTaskHandle = nullptr;
@@ -1857,6 +1894,7 @@ void startStreaming() {
 
     streamingStarted = true;
     lastScheduleCheck = millis();
+    lastNtpSync = millis();
     Serial.println("──────────────────────────────────────────────────");
     Serial.println("[Boot] Streaming audio");
     Serial.printf("[Boot] Free Heap: %lu bytes\n", (unsigned long)ESP.getFreeHeap());
@@ -1975,6 +2013,12 @@ void loop() {
             lastPowerReadTime = millis();
             readPowerMonitor();
             sendTelemetryPacket();
+        }
+
+        // Periodically re-sync NTP to prevent clock drift
+        if (millis() - lastNtpSync >= NTP_RESYNC_INTERVAL_MS) {
+            lastNtpSync = millis();
+            resyncTime();
         }
 
         // Periodically log UDP performance stats
