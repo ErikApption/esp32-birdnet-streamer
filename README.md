@@ -20,101 +20,24 @@ ESP32-S3 project that captures audio from an I2S MEMS microphone and streams Opu
 - ESP32-S3-DevKitC1 (N16R8)
 - I2S MEMS microphone (e.g. INMP441, SPH0645, ICS-43434)
 
-### Wiring the I2S Microphone
+### Wiring
 
-Most I2S MEMS microphones (INMP441, SPH0645, ICS-43434) have 6 pins. Connect them to the ESP32-S3 DevKitC as follows:
-
-| Mic Pin | Function       | Wire   | ESP32-S3 GPIO | Notes                                                                       |
-| ------- | -------------- | ------ | ------------- | --------------------------------------------------------------------------- |
-| VDD     | Power          | Brown  | GPIO 10       | Powered from a GPIO pin (~1.4 mA). Do NOT use 5V — MEMS mics are 3.3V.     |
-| GND     | Ground         | Black  | GND           |                                                                             |
-| SCK     | Bit Clock      | Orange | GPIO 4        | Serial clock driven by ESP32                                                |
-| WS      | Word Select    | Yellow | GPIO 5        | Frame/channel sync signal                                                   |
-| SD      | Serial Data    | Red    | GPIO 6        | Audio data output from mic                                                  |
-| L/R     | Channel select | Green  | GND           | Tie to GND for left channel, 3.3V for right channel. Code defaults to left. |
-
-### Wiring the Status LED
-
-A standard red LED on GPIO 11 indicates system state during boot and operation.
-
-| LED Pin  | Connect to     | Notes                                                                 |
-| -------- | -------------- | --------------------------------------------------------------------- |
-| Anode (+)| GPIO 11        | Through a current-limiting resistor                                   |
-| Cathode (−)| GND          | Any GND pin on the ESP32-S3 DevKitC                                   |
-
-**Resistor selection:** Use a **330 Ω** resistor in series with the LED anode. This limits current to approximately 5 mA at 3.3V GPIO output (assuming a typical red LED forward voltage of 1.7V), which is bright enough to be visible without wasting power. A 220 Ω resistor also works if you want slightly brighter output (~7 mA).
-
-```
-ESP32-S3 GPIO 11 ───[ 330Ω ]───►|─── GND
-                              (red LED)
-```
-
-#### LED flash patterns
-
-| Pattern                      | Meaning                                                    |
-| ---------------------------- | ---------------------------------------------------------- |
-| One long flash (800 ms)     | Boot success — WiFi connected via saved or compile-time credentials |
-| Single flash every 5 s       | Captive portal active — waiting for WiFi configuration     |
-| Double flash every 5 s       | WiFi connection failed (device will reboot)                |
-| Triple flash every 5 s       | I2S microphone initialization failed                       |
-| Off                          | System operating normally                                  |
-
-#### Wiring diagram (text)
-
-```
-ESP32-S3 DevKitC              I2S MEMS Mic
-─────────────────             ────────────
-GPIO 10 ──────────────────────  VDD  ← powered from GPIO
-GND   ────────────────────────  GND
-GPIO 4 ───────────────────────  SCK
-GPIO 5 ───────────────────────  WS
-GPIO 6 ───────────────────────  SD
-GND   ────────────────────────  L/R  ← left channel
-
-                              Status LED
-                              ──────────
-GPIO 11 ──[ 330Ω ]──►|──────  GND  (red LED, anode to resistor)
-```
-
-#### Tips
-
-- Keep wires short (< 10 cm) to avoid noise on the clock lines.
-- Add a 100 nF decoupling capacitor between VDD and GND as close to the mic as possible.
-- If you hear silence, double-check that L/R (SEL) is tied to GND (left) — the firmware reads the left channel only.
-- To use the right channel instead, change `I2S_CHANNEL_FMT_ONLY_LEFT` to `I2S_CHANNEL_FMT_ONLY_RIGHT` in `main.cpp` and tie L/R to 3.3V.
-- The pin assignments can be changed by editing the `I2S_WS_PIN`, `I2S_SD_PIN`, and `I2S_SCK_PIN` defines at the top of `main.cpp`.
-
-### Complete GPIO Pin Assignment Table
-
-All ESP32-S3 GPIOs used in this project, including the I2S microphone and the battery/solar power monitoring circuit.
-
-| GPIO | Function          | Direction  | Subsystem        | Notes                                                        |
-|------|-------------------|------------|------------------|--------------------------------------------------------------|
-| 4    | I2S_SCK (BCLK)   | OUTPUT     | I2S Microphone   | Bit clock to INMP441                                         |
-| 5    | I2S_WS (LRCLK)   | OUTPUT     | I2S Microphone   | Word select / frame sync                                     |
-| 6    | I2S_SD (DOUT)     | INPUT      | I2S Microphone   | Serial audio data from mic                                   |
-| 7    | MONITOR_EN        | OUTPUT     | Power Monitor    | MOSFET gate — enables voltage dividers (10kΩ pull-down)      |
-| 8    | VBAT_SENSE        | ADC INPUT  | Power Monitor    | Battery voltage via divider (ADC1_CH7, 11dB atten)           |
-| 9    | VSOL_SENSE        | ADC INPUT  | Power Monitor    | Solar panel voltage via divider (ADC1_CH8, 11dB atten)       |
-| 10   | MIC_POWER         | OUTPUT     | I2S Microphone   | Powers INMP441 VDD (~1.4 mA, software-controlled)            |
-| 11   | STATUS_LED        | OUTPUT     | Status LED       | Red LED via 330Ω resistor — boot/error flash patterns        |
-
-
-#### Pin selection rationale
-
-- **GPIOs 4–6** — I2S peripheral pins, grouped sequentially for clean routing.
-- **GPIO 7** — MOSFET gate for the zero-quiescent-current power monitor switch. Held LOW during deep sleep by 10kΩ pull-down resistor; no RTC config needed.
-- **GPIOs 8–9** — ADC1 channels (CH7, CH8). ADC1 remains usable when WiFi is active (ADC2 is not). 11dB attenuation gives 0–3.1V input range.
-- **GPIO 10** — Mic power. Allows software power-cycling of the INMP441 and draws zero current during deep sleep (pin goes Hi-Z).
-- **GPIO 11** — Status LED. General-purpose output driving a red LED through a 330Ω resistor. Draws ~5 mA only while flashing; off during normal operation and deep sleep.
-- All selected pins are general-purpose on the ESP32-S3-DevKitC-1 (N16R8) with no conflicting boot-strapping or flash functions.
+See [docs/wiring.md](docs/wiring.md) for complete wiring details including:
+- I2S microphone connections
+- Status LED circuit
+- Solar/battery power system with buck-boost modules and Schottky diodes
+- GPIO pin assignments and rationale
 
 ## Power Setup
 
-- Source: 3S NiMh batteries
-- Buck/Boost module for powering the ESP32 from the 3S batteries
-- NiMh charger module for charging the batteries from a USB-C solar panel
-- Power monitoring for solar panel input and battery voltage
+Solar-powered with 3S NiMH batteries. Two buck-boost modules and Schottky diode isolation provide both a battery-backed path and a direct solar bypass for the ESP32. See [docs/wiring.md](docs/wiring.md#power-system) for the full power system schematic and component details.
+
+- Buck-Boost #1: Solar panel → 5V (feeds NiMH charger)
+- 3S NiMH battery pack (3.6V nominal, charged via dedicated NiMH charger module)
+- Buck-Boost #2: Battery/solar → 3.3V (powers ESP32 directly)
+- Direct solar path through Schottky diode to BB2, bypassing batteries when sun is available
+- Schottky diodes on all paths to prevent reverse current from batteries back to solar panel
+- Power monitoring circuit for battery and solar voltage telemetry (see [docs/power-monitor-circuit.md](docs/power-monitor-circuit.md))
 
 ## Build Instructions
 
