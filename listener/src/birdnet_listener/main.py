@@ -200,6 +200,13 @@ def create_app(
         This WAV stream decodes on the listener and has no pacing, so VLC
         may struggle with bursty delivery. Use --network-caching=5000 in VLC.
         """
+        if not audio_buffer.has_fresh_data and len(audio_buffer._buffer) == 0:
+            return PlainTextResponse(
+                content="No audio stream available — ESP32 is not sending data",
+                status_code=503,
+                headers={"Retry-After": "5"},
+            )
+
         wav_header = make_wav_header(sample_rate, channels=channels)
 
         async def audio_generator() -> AsyncGenerator[bytes, None]:
@@ -243,6 +250,12 @@ def create_app(
         3. If the playout buffer runs dry (network stall), wait for more data
            and resume delivery without a clock reset.
         """
+        if not opus_buffer.has_fresh_data and len(opus_buffer._buffer) == 0:
+            return PlainTextResponse(
+                content="No audio stream available — ESP32 is not sending data",
+                status_code=503,
+                headers={"Retry-After": "5"},
+            )
         # Frame duration at 48kHz with 60ms Opus frames
         frame_duration_s = 60.0 / 1000.0
 

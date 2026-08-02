@@ -26,14 +26,27 @@ class StreamBuffer:
         self._buffer: deque[bytes] = deque(maxlen=max_chunks)
         self._seq = 0
         self._subscribers: list[asyncio.Event] = []
+        self._last_push_time: float = 0.0  # monotonic time of the last push
 
     @property
     def has_subscribers(self) -> bool:
         return len(self._subscribers) > 0
 
+    @property
+    def has_fresh_data(self) -> bool:
+        """Return True if data was pushed recently (within the last 10 seconds)."""
+        if self._last_push_time == 0.0:
+            return False
+        return (time.monotonic() - self._last_push_time) < 10.0
+
+    def clear(self) -> None:
+        """Clear the buffer, discarding all stored chunks."""
+        self._buffer.clear()
+
     def push(self, data: bytes) -> None:
         self._buffer.append(data)
         self._seq += 1
+        self._last_push_time = time.monotonic()
         for event in self._subscribers:
             event.set()
 
@@ -270,6 +283,11 @@ class UDPReceiverProtocol(asyncio.DatagramProtocol):
                 self._receiving = False
                 self._stream_start_time = 0.0
                 self._diag_total_interruptions += 1
+                # Clear stale audio data so clients don't receive outdated frames
+                self.audio_buffer.clear()
+                if self.opus_buffer is not None:
+                    self.opus_buffer.clear()
+                    logger.debug("[UDP] Buffers cleared — no stale data will be served")
                 if self._on_stream_state_changed is not None:
                     self._on_stream_state_changed(False)
 

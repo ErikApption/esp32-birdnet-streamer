@@ -6,8 +6,9 @@ Complete wiring reference for the ESP32 BirdNet Streamer, covering the I2S micro
 
 Most I2S MEMS microphones (INMP441, SPH0645, ICS-43434) have 6 pins. Connect them to the ESP32-S3 DevKitC as follows:
 
+
 | Mic Pin | Function       | Wire   | ESP32-S3 GPIO | Notes                                                                       |
-| ------- | -------------- | ------ | ------------- | --------------------------------------------------------------------------- |
+| --------- | ---------------- | -------- | --------------- | ----------------------------------------------------------------------------- |
 | VDD     | Power          | Brown  | GPIO 10       | Powered from a GPIO pin (~1.4 mA). Do NOT use 5V — MEMS mics are 3.3V.     |
 | GND     | Ground         | Black  | GND           |                                                                             |
 | SCK     | Bit Clock      | Orange | GPIO 4        | Serial clock driven by ESP32                                                |
@@ -19,10 +20,11 @@ Most I2S MEMS microphones (INMP441, SPH0645, ICS-43434) have 6 pins. Connect the
 
 A standard red LED on GPIO 11 indicates system state during boot and operation.
 
-| LED Pin    | Connect to | Notes                                           |
-| ---------- | ---------- | ----------------------------------------------- |
-| Anode (+)  | GPIO 11    | Through a current-limiting resistor             |
-| Cathode (−)| GND        | Any GND pin on the ESP32-S3 DevKitC             |
+
+| LED Pin      | Connect to | Notes                               |
+| -------------- | ------------ | ------------------------------------- |
+| Anode (+)    | GPIO 11    | Through a current-limiting resistor |
+| Cathode (−) | GND        | Any GND pin on the ESP32-S3 DevKitC |
 
 **Resistor selection:** Use a **330 Ω** resistor in series with the LED anode. This limits current to approximately 5 mA at 3.3V GPIO output (assuming a typical red LED forward voltage of 1.7V), which is bright enough to be visible without wasting power. A 220 Ω resistor also works if you want slightly brighter output (~7 mA).
 
@@ -33,13 +35,14 @@ ESP32-S3 GPIO 11 ───[ 330Ω ]───►|─── GND
 
 ### LED Flash Patterns
 
-| Pattern                      | Meaning                                                    |
-| ---------------------------- | ---------------------------------------------------------- |
-| One long flash (800 ms)     | Boot success — WiFi connected via saved or compile-time credentials |
-| Single flash every 5 s       | Captive portal active — waiting for WiFi configuration     |
-| Double flash every 5 s       | WiFi connection failed (device will reboot)                |
-| Triple flash every 5 s       | I2S microphone initialization failed                       |
-| Off                          | System operating normally                                  |
+
+| Pattern                 | Meaning                                                              |
+| ------------------------- | ---------------------------------------------------------------------- |
+| One long flash (800 ms) | Boot success — WiFi connected via saved or compile-time credentials |
+| Single flash every 5 s  | Captive portal active — waiting for WiFi configuration              |
+| Double flash every 5 s  | WiFi connection failed (device will reboot)                          |
+| Triple flash every 5 s  | I2S microphone initialization failed                                 |
+| Off                     | System operating normally                                            |
 
 ## Power System
 
@@ -76,14 +79,15 @@ graph TD
 
 ### Components
 
-| Ref | Component              | Function                                                         |
-|-----|------------------------|------------------------------------------------------------------|
-| BB1 | Buck-Boost Module #1   | Converts solar panel voltage to 5V for NiMH charging             |
-| BB2 | Buck-Boost Module #2   | Converts battery (or direct solar) voltage to 3.3V for ESP32     |
-| CHG | NIUP11TA_3S            | 3S NiMH charger module — charges pack from the 5V output of BB1  |
-| D1  | Schottky Diode         | Blocks reverse current from BB1 back to solar panel              |
-| D3  | Schottky Diode         | Blocks reverse current from BB2 back to solar on direct path     |
-| D4  | Schottky Diode         | Blocks reverse current from BB2 input back into battery pack     |
+
+| Ref | Component            | Function                                                         |
+| ----- | ---------------------- | ------------------------------------------------------------------ |
+| BB1 | Buck-Boost Module #1 | Converts solar panel voltage to 5V for NiMH charging             |
+| BB2 | Buck-Boost Module #2 | Converts battery (or direct solar) voltage to 3.3V for ESP32     |
+| CHG | NIUP11TA_3S          | 3S NiMH charger module — charges pack from the 5V output of BB1 |
+| D1  | Schottky Diode       | Blocks reverse current from BB1 back to solar panel              |
+| D3  | Schottky Diode       | Blocks reverse current from BB2 back to solar on direct path     |
+| D4  | Schottky Diode       | Blocks reverse current from BB2 input back into battery pack     |
 
 ### Power Paths
 
@@ -96,11 +100,12 @@ The direct solar path allows the ESP32 to run directly from the solar panel when
 
 ### Schottky Diode Placement & Purpose
 
-| Diode | Location                          | Purpose                                                              |
-|-------|-----------------------------------|----------------------------------------------------------------------|
-| D1    | Solar panel → BB1 input           | Prevents BB1 output from feeding back into the solar panel at night  |
-| D3    | Solar panel → BB2 input           | Prevents BB2 output from feeding back to the solar panel; isolates direct path |
-| D4    | NiMH pack (+) → BB2 input         | Prevents current flowing from the direct solar path into the battery pack      |
+
+| Diode | Location                   | Purpose                                                                        |
+| ------- | ---------------------------- | -------------------------------------------------------------------------------- |
+| D1    | Solar panel → BB1 input   | Prevents BB1 output from feeding back into the solar panel at night            |
+| D3    | Solar panel → BB2 input   | Prevents BB2 output from feeding back to the solar panel; isolates direct path |
+| D4    | NiMH pack (+) → BB2 input | Prevents current flowing from the direct solar path into the battery pack      |
 
 **Why Schottky?** Schottky diodes have a low forward voltage drop (~0.2–0.4V) compared to standard silicon diodes (~0.7V). This minimizes power loss in the charging and supply paths, which matters in a solar-powered system where every millivolt counts.
 
@@ -129,17 +134,19 @@ Physical package (axial, e.g. 1N5817):
 ```
 
 **How to identify:**
+
 - **Band marking:** The silver or grey band printed on one end of the diode body marks the **cathode (−)**. Current flows *away* from the band.
 - **Schematic symbol:** The triangle points from anode to cathode: `▶|` — the vertical bar is the cathode side.
 - **Mnemonic:** The band looks like the flat bar in the schematic symbol `|`. Band = bar = cathode.
 
 **Orientation in this circuit:**
 
-| Diode | Anode connects to        | Cathode connects to       | Current direction allowed      |
-|-------|--------------------------|---------------------------|--------------------------------|
-| D1    | Solar panel (+)          | BB1 input (+)             | Solar → BB1 (charging path)    |
-| D3    | Solar panel (+)          | BB2 input (+)             | Solar → BB2 (direct ESP32 path)|
-| D4    | 3S NiMH pack (+)        | BB2 input (+)             | Battery → BB2 (discharge path) |
+
+| Diode | Anode connects to | Cathode connects to | Current direction allowed        |
+| ------- | ------------------- | --------------------- | ---------------------------------- |
+| D1    | Solar panel (+)   | BB1 input (+)       | Solar → BB1 (charging path)     |
+| D3    | Solar panel (+)   | BB2 input (+)       | Solar → BB2 (direct ESP32 path) |
+| D4    | 3S NiMH pack (+)  | BB2 input (+)       | Battery → BB2 (discharge path)  |
 
 In all three cases: the **band (cathode) faces toward the buck-boost module input**. Solar/battery positive wire goes to the un-banded end.
 
@@ -251,16 +258,17 @@ An N-channel MOSFET (FQP30N06L) on the low side acts as a switch. When GPIO 7 go
 
 ### Parts List
 
-| Ref | Part           | Value   | Purpose                                |
-|-----|----------------|---------|----------------------------------------|
-| R1  | Resistor       | 100kΩ   | Battery divider upper leg              |
-| R2  | Resistor       | 100kΩ   | Battery divider lower leg              |
-| R3  | Resistor       | 220kΩ   | Solar divider upper leg                |
-| R4  | Resistor       | 100kΩ   | Solar divider lower leg                |
-| R5  | Resistor       | 10kΩ    | Gate pull-down (keeps Q1 off in sleep) |
-| Q1  | N-MOSFET       | FQP30N06L | Low-side switch (logic-level, TO-220)|
-| C1  | Capacitor      | 100nF   | ADC filter on GPIO 8                   |
-| C2  | Capacitor      | 100nF   | ADC filter on GPIO 9                   |
+
+| Ref | Part      | Value     | Purpose                                |
+| ----- | ----------- | ----------- | ---------------------------------------- |
+| R1  | Resistor  | 100kΩ    | Battery divider upper leg              |
+| R2  | Resistor  | 100kΩ    | Battery divider lower leg              |
+| R3  | Resistor  | 220kΩ    | Solar divider upper leg                |
+| R4  | Resistor  | 100kΩ    | Solar divider lower leg                |
+| R5  | Resistor  | 10kΩ     | Gate pull-down (keeps Q1 off in sleep) |
+| Q1  | N-MOSFET  | FQP30N06L | Low-side switch (logic-level, TO-220)  |
+| C1  | Capacitor | 100nF     | ADC filter on GPIO 8                   |
+| C2  | Capacitor | 100nF     | ADC filter on GPIO 9                   |
 
 ### FQP30N06L Pinout (TO-220, facing label)
 
@@ -279,10 +287,11 @@ An N-channel MOSFET (FQP30N06L) on the low side acts as a switch. When GPIO 7 go
 
 ### Voltage Divider Ratios
 
-| Channel | Upper | Lower | Ratio     | Example: input → ADC             |
-|---------|-------|-------|-----------|----------------------------------|
-| Battery | R1 100kΩ | R2 100kΩ | ÷ 2   | 3.6V → 1.80V, 4.5V → 2.25V     |
-| Solar   | R3 220kΩ | R4 100kΩ | ÷ 3.2 | 5.5V → 1.72V, 7.0V → 2.19V     |
+
+| Channel | Upper     | Lower     | Ratio  | Example: input → ADC        |
+| --------- | ----------- | ----------- | -------- | ------------------------------ |
+| Battery | R1 100kΩ | R2 100kΩ | ÷ 2   | 3.6V → 1.80V, 4.5V → 2.25V |
+| Solar   | R3 220kΩ | R4 100kΩ | ÷ 3.2 | 5.5V → 1.72V, 7.0V → 2.19V |
 
 All ADC values stay within the ESP32-S3's 0–3.1V range (11dB attenuation).
 
@@ -305,16 +314,18 @@ ESP32-S3 GND     ──── Q1 Source, R5 bottom
 
 All ESP32-S3 GPIOs used in this project:
 
-| GPIO | Function          | Direction  | Subsystem        | Notes                                                        |
-|------|-------------------|------------|------------------|--------------------------------------------------------------|
-| 4    | I2S_SCK (BCLK)   | OUTPUT     | I2S Microphone   | Bit clock to INMP441                                         |
-| 5    | I2S_WS (LRCLK)   | OUTPUT     | I2S Microphone   | Word select / frame sync                                     |
-| 6    | I2S_SD (DOUT)     | INPUT      | I2S Microphone   | Serial audio data from mic                                   |
-| 7    | MONITOR_EN        | OUTPUT     | Power Monitor    | MOSFET gate — enables voltage dividers (10kΩ pull-down)      |
-| 8    | VBAT_SENSE        | ADC INPUT  | Power Monitor    | Battery voltage via divider (ADC1_CH7, 11dB atten)           |
-| 9    | VSOL_SENSE        | ADC INPUT  | Power Monitor    | Solar panel voltage via divider (ADC1_CH8, 11dB atten)       |
-| 10   | MIC_POWER         | OUTPUT     | I2S Microphone   | Powers INMP441 VDD (~1.4 mA, software-controlled)            |
-| 11   | STATUS_LED        | OUTPUT     | Status LED       | Red LED via 330Ω resistor — boot/error flash patterns        |
+
+| GPIO  | Function       | Direction | Color  | Subsystem      | Notes                                                     |
+| ------- | ---------------- | ----------- | -------- | ---------------- | ----------------------------------------------------------- |
+| RESET |                |           | Yellow |                |                                                           |
+| 4     | I2S_SCK (BCLK) | OUTPUT    | Yellow | I2S Microphone | Bit clock to INMP441                                      |
+| 5     | I2S_WS (LRCLK) | OUTPUT    | Green  | I2S Microphone | Word select / frame sync                                  |
+| 6     | I2S_SD (DOUT)  | INPUT     | Blue   | I2S Microphone | Serial audio data from mic                                |
+| 7     | MONITOR_EN     | OUTPUT    | Blue   | Power Monitor  | MOSFET gate — enables voltage dividers (10kΩ pull-down) |
+| 8     | VBAT_SENSE     | ADC INPUT | Purple | Power Monitor  | Battery voltage via divider (ADC1_CH7, 11dB atten)        |
+| 9     | VSOL_SENSE     | ADC INPUT | Green  | Power Monitor  | Solar panel voltage via divider (ADC1_CH8, 11dB atten)    |
+| 10    | MIC_POWER      | OUTPUT    | Orange | I2S Microphone | Powers INMP441 VDD (~1.4 mA, software-controlled)         |
+| 11    | STATUS_LED     | OUTPUT    | Yellow | Status LED     | Red LED via 330Ω resistor — boot/error flash patterns   |
 
 ### Pin Selection Rationale
 
