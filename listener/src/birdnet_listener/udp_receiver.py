@@ -105,20 +105,20 @@ class UDPReceiverProtocol(asyncio.DatagramProtocol):
     LARGE_GAP_THRESHOLD = 128  # gaps larger than this are treated as reordering
 
     # Voltage divider ratios (applied to raw ADC values to recover real voltage)
-    VBAT_DIVIDER_RATIO = 2.0   # R1=R2=100kΩ → Vreal = Vadc × 2
-    VSOL_DIVIDER_RATIO = 3.2   # R3=220kΩ, R4=100kΩ → Vreal = Vadc × 3.2
+    VBAT_DIVIDER_RATIO = 5.7   # R1=470kΩ, R2=100kΩ → Vreal = Vadc × 5.7
+    VSOL_DIVIDER_RATIO = 7.8   # R3=680kΩ, R4=100kΩ → Vreal = Vadc × 7.8
 
-    # Battery SoC estimation — 3S NiMH AA (3 × 1.2V nominal)
-    # NiMH discharge curve is fairly flat between 1.1–1.3V/cell.
-    # Below 1.0V/cell the cell is considered empty (risk of damage).
-    # After a full charge, resting OCV is ~1.4V/cell.
-    VBAT_EMPTY = 3.0  # 3 × 1.0V/cell — deep discharge cutoff
-    VBAT_FULL  = 4.2  # 3 × 1.4V/cell — resting OCV after full charge
-    VBAT_ABS_MAX = 4.5  # Anything above this means charger is pushing voltage
+    # Battery SoC estimation — 12V battery (lead-acid or LiFePO4 4S)
+    # Lead-acid: 12.7V=100%, 12.4V=75%, 12.0V=25%, 11.8V=0%
+    # LiFePO4 4S: 14.6V=100%, 13.2V=50%, 12.0V=10%
+    # Using a range that works for both chemistries as a rough guide.
+    VBAT_EMPTY = 11.5  # Deep discharge cutoff (below this, battery is dead)
+    VBAT_FULL  = 13.0  # Resting voltage when fully charged (lead-acid OCV)
+    VBAT_ABS_MAX = 14.8  # Anything above this means charger is pushing voltage
 
-    # Solar voltage threshold — above this, the charge module is likely active
+    # Solar voltage threshold — above this, the charge controller is likely active
     # and the battery sense reading includes charger output voltage, not true SoC.
-    VSOL_CHARGING_THRESHOLD = 4.0  # Volts (panel producing meaningful power)
+    VSOL_CHARGING_THRESHOLD = 14.0  # Volts (panel producing meaningful power)
 
     # Audio level thresholds for silence/quiet detection (16-bit PCM)
     SILENCE_THRESHOLD = 50         # peak below this = digital silence (dead mic / DTX)

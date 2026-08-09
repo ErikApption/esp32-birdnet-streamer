@@ -210,50 +210,35 @@ Solar Panel (−) ─────────── Common GND (shared with batt
 
 ## Power Measurement Circuit
 
-Voltage monitoring for the 3S NiMH battery and solar panel input, with zero quiescent current when idle. The ESP32 enables the circuit only during measurement (~5 ms), then shuts it off completely.
+Voltage monitoring for the 12V battery and solar panel input using always-on resistor dividers. The dividers draw ~58 µA continuously — negligible for a 12V system.
 
 For full design rationale, calculations, calibration procedures, and troubleshooting, see [docs/power-monitor-circuit.md](power-monitor-circuit.md).
 
 ### How It Works
 
-An N-channel MOSFET (FQP30N06L) on the low side acts as a switch. When GPIO 7 goes HIGH, current flows through two resistor voltage dividers — one for battery, one for solar. The divided voltages appear on GPIO 8 and GPIO 9 for the ESP32's ADC to read. When GPIO 7 goes LOW (or during deep sleep), the MOSFET is off and the circuit draws **zero current**.
+Two resistor voltage dividers are permanently connected between the voltage sources and ground. The divided voltages appear on GPIO 8 and GPIO 9 for the ESP32's ADC to read at any time. No switching is needed — the ~58 µA continuous draw is negligible for a 12V battery.
 
 ### Schematic
 
 ```
                    VBAT (+)              VSOLAR (+)
-              (from 3S NiMH)        (from solar panel)
+              (from 12V battery)    (from solar panel)
                      │                       │
                   ┌──┴──┐                 ┌──┴──┐
                   │ R1   │                 │ R3   │
-                  │100kΩ │                 │220kΩ │
+                  │470kΩ │                 │680kΩ │
                   └──┬──┘                 └──┬──┘
                      │                       │
                      ├─── GPIO 8 (ADC)       ├─── GPIO 9 (ADC)
                      │                       │
-                     ├──┤C1├──┐              ├──┤C2├──┐
-                     │  100nF │              │  100nF │
-                     └──┬──┘  │              └──┬──┘  │
-                        │     │                 │     │
-                     ┌──┴──┐  │              ┌──┴──┐  │
-                     │ R2   │  │              │ R4   │  │
-                     │100kΩ │  │              │100kΩ │  │
-                     └──┬──┘  │              └──┬──┘  │
-                        │     │                 │     │
-                        └──┬──┘                 └──┬──┘
-                           │                       │
-                           └───────────┬───────────┘
-                                       │
-                                  D (Drain)
-                              ┌────────┴────────┐
-                              │  Q1  FQP30N06L  │
-                              │    (TO-220)     │
-                              └────────┬────────┘
-                              G        │ S
-                              │        │
-                     GPIO 7 ──┘        └─── GND
-                       │
-                     (R5: 10kΩ pull-down to GND)
+                  ┌──┴──┐  ┌──┴──┐        ┌──┴──┐  ┌──┴──┐
+                  │ R2   │  │ C1   │        │ R4   │  │ C2   │
+                  │100kΩ │  │100nF │        │100kΩ │  │100nF │
+                  └──┬──┘  └──┬──┘        └──┬──┘  └──┬──┘
+                     │        │              │        │
+                     └────┬───┘              └────┬───┘
+                          │                       │
+                         GND                     GND
 ```
 
 ### Parts List
@@ -261,53 +246,35 @@ An N-channel MOSFET (FQP30N06L) on the low side acts as a switch. When GPIO 7 go
 
 | Ref | Part      | Value     | Purpose                                |
 | ----- | ----------- | ----------- | ---------------------------------------- |
-| R1  | Resistor  | 100kΩ    | Battery divider upper leg              |
+| R1  | Resistor  | 470kΩ    | Battery divider upper leg              |
 | R2  | Resistor  | 100kΩ    | Battery divider lower leg              |
-| R3  | Resistor  | 220kΩ    | Solar divider upper leg                |
+| R3  | Resistor  | 680kΩ    | Solar divider upper leg                |
 | R4  | Resistor  | 100kΩ    | Solar divider lower leg                |
-| R5  | Resistor  | 10kΩ     | Gate pull-down (keeps Q1 off in sleep) |
-| Q1  | N-MOSFET  | FQP30N06L | Low-side switch (logic-level, TO-220)  |
 | C1  | Capacitor | 100nF     | ADC filter on GPIO 8                   |
 | C2  | Capacitor | 100nF     | ADC filter on GPIO 9                   |
-
-### FQP30N06L Pinout (TO-220, facing label)
-
-```
-    ┌──────────┐
-    │ FQP30N06L│
-    │          │
-    └─┬──┬──┬─┘
-      │  │  │
-      G  D  S
-      │  │  │
-      │  │  └─── GND
-      │  └────── Divider common ground (bottom of R2 + R4)
-      └───────── GPIO 7 (+ R5 10kΩ pull-down to GND)
-```
 
 ### Voltage Divider Ratios
 
 
-| Channel | Upper     | Lower     | Ratio  | Example: input → ADC        |
-| --------- | ----------- | ----------- | -------- | ------------------------------ |
-| Battery | R1 100kΩ | R2 100kΩ | ÷ 2   | 3.6V → 1.80V, 4.5V → 2.25V |
-| Solar   | R3 220kΩ | R4 100kΩ | ÷ 3.2 | 5.5V → 1.72V, 7.0V → 2.19V |
+| Channel | Upper     | Lower     | Ratio  | Example: input → ADC           |
+| --------- | ----------- | ----------- | -------- | -------------------------------- |
+| Battery | R1 470kΩ | R2 100kΩ | ÷ 5.7 | 12.8V → 2.25V, 14.8V → 2.60V |
+| Solar   | R3 680kΩ | R4 100kΩ | ÷ 7.8  | 17V → 2.18V, 22V → 2.82V     |
 
 All ADC values stay within the ESP32-S3's 0–3.1V range (11dB attenuation).
 
 ### Measurement Points (Where to Connect)
 
-- **VBAT (+):** Connect to the **3S NiMH pack positive terminal** (same node as D4 anode)
+- **VBAT (+):** Connect to the **12V battery positive terminal** (same node as D4 anode)
 - **VSOLAR (+):** Connect to the **solar panel positive wire** (before D1/D3, raw panel voltage)
 - **GND:** Common ground shared with the rest of the system
 
 ### Wiring to ESP32
 
 ```
-ESP32-S3 GPIO 7  ──── Q1 Gate  (+ R5 10kΩ to GND)
 ESP32-S3 GPIO 8  ──── R1/R2 midpoint (battery ADC sense node)
 ESP32-S3 GPIO 9  ──── R3/R4 midpoint (solar ADC sense node)
-ESP32-S3 GND     ──── Q1 Source, R5 bottom
+ESP32-S3 GND     ──── R2 bottom, R4 bottom, C1 bottom, C2 bottom
 ```
 
 ## Complete GPIO Pin Assignment
@@ -318,10 +285,9 @@ All ESP32-S3 GPIOs used in this project:
 | GPIO  | Function       | Direction | Color  | Subsystem      | Notes                                                     |
 | ------- | ---------------- | ----------- | -------- | ---------------- | ----------------------------------------------------------- |
 | RESET |                |           | Yellow |                |                                                           |
-| 4     | I2S_SCK (BCLK) | OUTPUT    | Yellow | I2S Microphone | Bit clock to INMP441                                      |
-| 5     | I2S_WS (LRCLK) | OUTPUT    | Green  | I2S Microphone | Word select / frame sync                                  |
-| 6     | I2S_SD (DOUT)  | INPUT     | Blue   | I2S Microphone | Serial audio data from mic                                |
-| 7     | MONITOR_EN     | OUTPUT    | Blue   | Power Monitor  | MOSFET gate — enables voltage dividers (10kΩ pull-down) |
+| 4     | I2S_SCK (BCLK) | OUTPUT    | Blue | I2S Microphone | Bit clock to INMP441                                      |
+| 5     | I2S_WS (LRCLK) | OUTPUT    | Yellow  | I2S Microphone | Word select / frame sync                                  |
+| 6     | I2S_SD (DOUT)  | INPUT     | White   | I2S Microphone | Serial audio data from mic                                |
 | 8     | VBAT_SENSE     | ADC INPUT | Purple | Power Monitor  | Battery voltage via divider (ADC1_CH7, 11dB atten)        |
 | 9     | VSOL_SENSE     | ADC INPUT | Green  | Power Monitor  | Solar panel voltage via divider (ADC1_CH8, 11dB atten)    |
 | 10    | MIC_POWER      | OUTPUT    | Orange | I2S Microphone | Powers INMP441 VDD (~1.4 mA, software-controlled)         |
@@ -330,7 +296,6 @@ All ESP32-S3 GPIOs used in this project:
 ### Pin Selection Rationale
 
 - **GPIOs 4–6** — I2S peripheral pins, grouped sequentially for clean routing.
-- **GPIO 7** — MOSFET gate for the zero-quiescent-current power monitor switch. Held LOW during deep sleep by 10kΩ pull-down resistor; no RTC config needed.
 - **GPIOs 8–9** — ADC1 channels (CH7, CH8). ADC1 remains usable when WiFi is active (ADC2 is not). 11dB attenuation gives 0–3.1V input range.
 - **GPIO 10** — Mic power. Allows software power-cycling of the INMP441 and draws zero current during deep sleep (pin goes Hi-Z).
 - **GPIO 11** — Status LED. General-purpose output driving a red LED through a 330Ω resistor. Draws ~5 mA only while flashing; off during normal operation and deep sleep.
@@ -354,10 +319,9 @@ GPIO 11 ──[ 330Ω ]──►|──────  GND  (red LED, anode to res
 
                               Power Monitor
                               ─────────────
-GPIO 7  ──────────────────────  Q1 Gate (+ 10kΩ to GND)
 GPIO 8  ──────────────────────  R1/R2 midpoint (battery sense)
 GPIO 9  ──────────────────────  R3/R4 midpoint (solar sense)
-GND     ──────────────────────  Q1 Source, R5 to GND
+GND     ──────────────────────  R2 bottom, R4 bottom
 ```
 
 ## Tips

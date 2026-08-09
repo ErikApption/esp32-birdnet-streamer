@@ -62,7 +62,6 @@
 #define NTP_SERVER        "pool.ntp.org"
 
 // ─── Power Monitor Configuration ─────────────────────────────────────────────
-#define MONITOR_EN_PIN    7   // GPIO to enable voltage dividers (MOSFET gate)
 #define VBAT_ADC_PIN      8   // ADC1_CH7 — battery voltage
 #define VSOL_ADC_PIN      9   // ADC1_CH8 — solar voltage
 #define ADC_VREF          3.1f
@@ -547,53 +546,31 @@ IPAddress resolveHost(const char* hostname) {
 
 // ─── Power Monitor ───────────────────────────────────────────────────────────
 void powerMonitorInit() {
-    pinMode(MONITOR_EN_PIN, OUTPUT);
-    digitalWrite(MONITOR_EN_PIN, LOW);  // Dividers OFF by default
     analogSetAttenuation(ADC_11db);     // 0–3.1V range
     analogReadResolution(12);           // 12-bit (0–4095)
-    Serial.println("[Power] Monitor initialized");
+    Serial.println("[Power] Monitor initialized (always-on dividers, no MOSFET)");
 
-    // ─── Self-test: diagnose voltage divider wiring ─────────────────────
+    // ─── Self-test: validate voltage divider readings ────────────────────
     Serial.println("[Power] ┌─── DIAGNOSTIC SELF-TEST ───────────────────────┐");
 
-    // Step 1: Read with MOSFET OFF — both ADC pins should read near 0V
-    // (no current path through dividers, pins should be at ground potential
-    //  through R2/R4 if wired correctly, or floating if ground path is broken)
-    digitalWrite(MONITOR_EN_PIN, LOW);
-    delay(10);
-    float batOff = readAdcVoltage(VBAT_ADC_PIN);
-    float solOff = readAdcVoltage(VSOL_ADC_PIN);
-    Serial.printf("[Power] │ MOSFET OFF  — bat ADC: %.3fV, sol ADC: %.3fV\n", batOff, solOff);
+    delay(100);  // Brief settling for ADC
+    float batAdc = readAdcVoltage(VBAT_ADC_PIN);
+    float solAdc = readAdcVoltage(VSOL_ADC_PIN);
+    Serial.printf("[Power] │ ADC readings — bat: %.3fV, sol: %.3fV\n", batAdc, solAdc);
 
-    if (batOff > 0.1f || solOff > 0.1f) {
-        Serial.println("[Power] │ ⚠ PROBLEM: ADC reads >0.1V with MOSFET off!");
-        Serial.println("[Power] │   Expected: ~0V (divider has no ground path)");
-        Serial.println("[Power] │   If reading near 3.0V: pins are floating (broken GND wiring)");
-        Serial.println("[Power] │   If reading 1-2V: possible leakage or wrong pin connection");
-    } else {
-        Serial.println("[Power] │ ✓ OK — pins near 0V when dividers disabled");
-    }
-
-    // Step 2: Read with MOSFET ON — should see actual divided voltages
-    digitalWrite(MONITOR_EN_PIN, HIGH);
-    delay(5000);  // Full settling for large filter caps (~10µF × 100kΩ = 1s τ, need ~5τ)
-    float batOn = readAdcVoltage(VBAT_ADC_PIN);
-    float solOn = readAdcVoltage(VSOL_ADC_PIN);
-    Serial.printf("[Power] │ MOSFET ON   — bat ADC: %.3fV, sol ADC: %.3fV\n", batOn, solOn);
-
-    // Expected battery ADC for 3S NiMH: 1.5V–2.25V (3.0V–4.5V / 2)
-    float batReal = batOn * 2.0f;
-    float solReal = solOn * 3.2f;
+    // Expected battery ADC for 12V system: 1.75V–2.60V (10.0V–14.8V / 5.7)
+    float batReal = batAdc * 5.7f;
+    float solReal = solAdc * 7.8f;
     Serial.printf("[Power] │ Calculated  — bat: %.2fV, sol: %.2fV\n", batReal, solReal);
 
-    if (batReal > 4.5f) {
-        Serial.println("[Power] │ ⚠ PROBLEM: Battery reads > 4.5V (impossible for 3S NiMH)");
+    if (batReal > 14.8f) {
+        Serial.println("[Power] │ ⚠ PROBLEM: Battery reads > 14.8V (too high for 12V system)");
         Serial.println("[Power] │   Check: is battery sense wire on correct terminal?");
-        Serial.println("[Power] │   Check: is MOSFET drain connected to divider ground?");
-    } else if (batReal < 2.5f) {
-        Serial.println("[Power] │ ⚠ WARNING: Battery reads < 2.5V (cells may be dead)");
+        Serial.println("[Power] │   Check: R1/R2 divider wiring and values");
+    } else if (batReal < 9.0f) {
+        Serial.println("[Power] │ ⚠ WARNING: Battery reads < 9.0V (deeply discharged or disconnected)");
     } else {
-        Serial.printf("[Power] │ ✓ OK — battery %.2fV is within 3S NiMH range (3.0–4.5V)\n", batReal);
+        Serial.printf("[Power] │ ✓ OK — battery %.2fV is within 12V range (10.0–14.8V)\n", batReal);
     }
 
     if (solReal > 0.5f) {
@@ -602,19 +579,6 @@ void powerMonitorInit() {
         Serial.println("[Power] │ ℹ Solar: no voltage detected (panel disconnected or dark)");
     }
 
-    // Step 3: Check that switching actually changes the reading
-    float batDelta = fabsf(batOn - batOff);
-    float solDelta = fabsf(solOn - solOff);
-    Serial.printf("[Power] │ Delta (on-off) — bat: %.3fV, sol: %.3fV\n", batDelta, solDelta);
-
-    if (batDelta < 0.05f) {
-        Serial.println("[Power] │ ⚠ PROBLEM: Battery ADC doesn't change with MOSFET!");
-        Serial.println("[Power] │   MOSFET may not be switching, or divider not connected.");
-        Serial.println("[Power] │   Check: GPIO 7 → MOSFET gate, drain → R2+R4 bottom, source → GND");
-    }
-
-    // Disable dividers
-    digitalWrite(MONITOR_EN_PIN, LOW);
     Serial.println("[Power] └────────────────────────────────────────────────┘");
 }
 
@@ -629,19 +593,8 @@ float readAdcVoltage(int pin) {
 }
 
 void readPowerMonitor() {
-    // Enable voltage dividers (skip if already HIGH due to diagnostic mode)
-    if (!diagnosticMode) {
-        digitalWrite(MONITOR_EN_PIN, HIGH);
-    }
-    delay(50);  // RC settling — τ = 100kΩ × 100nF = 10ms, need ~5τ for full charge
-
     float vBatAdc = readAdcVoltage(VBAT_ADC_PIN);
     float vSolAdc = readAdcVoltage(VSOL_ADC_PIN);
-
-    // Disable voltage dividers (only if not in diagnostic mode)
-    if (!diagnosticMode) {
-        digitalWrite(MONITOR_EN_PIN, LOW);
-    }
 
     // Store raw ADC voltages (divider scaling applied by the receiver)
     lastBatteryVoltage = vBatAdc;
@@ -674,23 +627,19 @@ void sendTelemetryPacket() {
 // ─── Diagnostic Mode Endpoints ───────────────────────────────────────────────
 void handleDiagStart() {
     diagnosticMode = true;
-    // Set voltage monitor pin HIGH for external measurement
-    digitalWrite(MONITOR_EN_PIN, HIGH);
     // Enable the onboard LED for signal indication
     lastSignalCheckTime = millis();
     lastDiagTelemetryTime = millis();
-    Serial.println("[Diag] Diagnostic mode STARTED — MONITOR_EN_PIN HIGH, LED active");
-    server.send(200, "application/json", "{\"diagnostic\":\"started\",\"monitor_pin\":\"HIGH\",\"led\":\"enabled\"}");
+    Serial.println("[Diag] Diagnostic mode STARTED — LED active, telemetry every 2s");
+    server.send(200, "application/json", "{\"diagnostic\":\"started\",\"led\":\"enabled\"}");
 }
 
 void handleDiagStop() {
     diagnosticMode = false;
-    // Restore voltage monitor pin to LOW (normal idle state)
-    digitalWrite(MONITOR_EN_PIN, LOW);
     // Turn off the LED to save power
     neopixelWrite(RGB_BUILTIN, 0, 0, 0);
-    Serial.println("[Diag] Diagnostic mode STOPPED — MONITOR_EN_PIN LOW, LED off");
-    server.send(200, "application/json", "{\"diagnostic\":\"stopped\",\"monitor_pin\":\"LOW\",\"led\":\"disabled\"}");
+    Serial.println("[Diag] Diagnostic mode STOPPED — LED off");
+    server.send(200, "application/json", "{\"diagnostic\":\"stopped\",\"led\":\"disabled\"}");
 }
 
 // ─── I2S Signal LED Indicator ────────────────────────────────────────────────
