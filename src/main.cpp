@@ -12,6 +12,7 @@
 #include <esp_system.h>
 #include <opus.h>
 #include <lwip/inet.h>  // htons, htonl for network byte order
+#include <esp_netif.h> // esp_netif_set_hostname for reliable DHCP hostname
 
 // Onboard LED
 #ifndef RGB_BUILTIN
@@ -164,6 +165,7 @@ bool udpFirstPacketLogged = false;
 uint32_t sampleRate = DEFAULT_SAMPLE_RATE;
 char sampleRateStr[8] = "48000";
 bool configured     = false;  // true once a config has been received (persisted in NVS)
+bool streamingStarted = false;  // true once audio streaming has been initialized
 
 static int32_t i2sReadBuffer[DMA_BUF_LEN];  // 32-bit I2S read buffer
 static int16_t i2sBuffer[DMA_BUF_LEN];     // 16-bit samples after bit-shift conversion
@@ -213,6 +215,7 @@ unsigned long lastBurstTime = 0;     // timestamp of last burst send
 
 // ─── Forward declarations ────────────────────────────────────────────────────
 void wifiInit();
+void wifiSetHostname();
 void otaInit();
 void i2sInit();
 void opusInit();
@@ -227,6 +230,7 @@ IPAddress resolveHost(const char* hostname);
 void streamAudio();
 void enterDeepSleep(uint64_t sleepSeconds);
 bool isWithinActiveWindow();
+uint64_t secondsUntilNextActiveWindow();
 void syncTime();
 void resyncTime();
 void loadSettings();
@@ -358,9 +362,14 @@ void handlePostConfig() {
         strncpy(utcOffset, server.arg("utc_offset").c_str(), sizeof(utcOffset) - 1);
         changed = true;
     }
+    bool sleepSettingChanged = false;
     if (server.hasArg("sleep_enabled")) {
         String val = server.arg("sleep_enabled");
-        sleepEnabled = (val == "true" || val == "1");
+        bool newSleepEnabled = (val == "true" || val == "1");
+        if (newSleepEnabled != sleepEnabled) {
+            sleepEnabled = newSleepEnabled;
+            sleepSettingChanged = true;
+        }
         changed = true;
     }
     if (server.hasArg("debug_mode")) {
@@ -384,6 +393,17 @@ void handlePostConfig() {
         ESP.restart();
     } else {
         handleGetConfig();
+    }
+
+    // Re-evaluate sleep status immediately when the sleep setting changes.
+    // If sleep was just enabled and we're outside the active window, sleep now.
+    // If sleep was just disabled, we simply stay awake (no action needed).
+    if (sleepSettingChanged && sleepEnabled && streamingStarted && !debugMode) {
+        if (!isWithinActiveWindow()) {
+            Serial.println("[Schedule] Sleep enabled while outside active window — going to sleep");
+            uint64_t sleepSec = secondsUntilNextActiveWindow();
+            enterDeepSleep(sleepSec);
+        }
     }
 }
 
@@ -895,6 +915,19 @@ void wifiRadioReset() {
     delay(200);
 }
 
+// ─── WiFi Hostname Helper ─────────────────────────────────────────────────────
+// Sets the DHCP hostname via both the Arduino API and the lower-level esp_netif
+// API. The Arduino WiFi.setHostname() alone is unreliable on ESP32-S3 — the
+// default "esp32s3-XXXXXX" overwrites it. esp_netif_set_hostname() writes
+// directly to the lwIP network interface and persists through the DHCP handshake.
+void wifiSetHostname() {
+    WiFi.setHostname(MDNS_HOSTNAME);
+    esp_netif_t *netif = esp_netif_get_handle_from_ifkey("WIFI_STA_DEF");
+    if (netif) {
+        esp_netif_set_hostname(netif, MDNS_HOSTNAME);
+    }
+}
+
 void wifiInit() {
     Serial.println("[WiFi] Initializing...");
 
@@ -910,7 +943,10 @@ void wifiInit() {
 
     // Set hostname BEFORE WiFi.begin() — this is what the DHCP client sends
     // to the router so the device shows up with a human-readable name.
-    WiFi.setHostname(MDNS_HOSTNAME);
+    // WiFi.setHostname() alone is unreliable on ESP32-S3 (gets overwritten by
+    // the default "esp32s3-XXXXXX"). Use the lower-level esp_netif API which
+    // writes directly to the network interface and sticks through DHCP.
+    wifiSetHostname();
     Serial.printf("[WiFi] Hostname set to: %s\n", MDNS_HOSTNAME);
 
     // Disable WiFi modem sleep — keeps the radio active during connection,
@@ -967,7 +1003,7 @@ void wifiInit() {
             if (attempt < maxAttempts - 1) {
                 Serial.println("[WiFi] Resetting radio before retry...");
                 wifiRadioReset();
-                WiFi.setHostname(MDNS_HOSTNAME);
+                wifiSetHostname();
                 WiFi.setSleep(false);
                 delay(1000);
             }
@@ -976,7 +1012,7 @@ void wifiInit() {
         if (WiFi.status() != WL_CONNECTED) {
             Serial.println("[WiFi] Build-time credentials exhausted");
             wifiRadioReset();
-            WiFi.setHostname(MDNS_HOSTNAME);
+            wifiSetHostname();
             delay(500);
         }
     }
@@ -988,7 +1024,7 @@ void wifiInit() {
 
         // Reset radio cleanly before WiFiManager takes over
         wifiRadioReset();
-        WiFi.setHostname(MDNS_HOSTNAME);
+        wifiSetHostname();
         WiFi.setSleep(false);
         delay(500);
 
@@ -1792,7 +1828,6 @@ unsigned long lastMdnsAnnounce = 0;
 unsigned long lastWifiCheck = 0;
 unsigned long lastNtpSync = 0;
 int wifiReconnectAttempts = 0;
-bool streamingStarted = false;
 TaskHandle_t audioTaskHandle = nullptr;
 
 // ─── Audio Task (runs on dedicated core with large stack) ────────────────────
