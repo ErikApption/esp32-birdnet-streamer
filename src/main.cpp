@@ -110,14 +110,14 @@ char utcOffset[4]   = DEFAULT_UTC_OFFSET;
 bool sleepEnabled   = false;
 
 // ─── Debug Mode ──────────────────────────────────────────────────────────────
-// Define FORCE_DEBUG_MODE at compile time to permanently disable deep sleep,
-// overriding the NVS setting. Useful during development/bench testing.
-// Can be set in platformio.ini: build_flags = -DFORCE_DEBUG_MODE
-#ifndef FORCE_DEBUG_MODE
-#define FORCE_DEBUG_MODE 0
+// Define DEBUG_MODE at compile time to permanently disable deep sleep.
+// Useful during development/bench testing.
+// Can be set in platformio.ini: build_flags = -DDEBUG_MODE
+#ifndef DEBUG_MODE
+#define DEBUG_MODE 0
 #endif
 
-bool debugMode      = FORCE_DEBUG_MODE;  // When true, deep sleep is completely disabled
+const bool debugMode = DEBUG_MODE;  // When true, deep sleep is completely disabled (compile-time only)
 
 // ─── Diagnostic Mode State ────────────────────────────────────────────────────
 bool diagnosticMode = false;  // true when /diag/start has been called
@@ -276,7 +276,6 @@ void loadSettings() {
     sleepEnabled = prefs.getBool("sleepOn", true);
     sampleRate = prefs.getUInt("sampleRate", DEFAULT_SAMPLE_RATE);
     configured = prefs.getBool("configured", false);
-    debugMode = prefs.getBool("debugMode", false) || FORCE_DEBUG_MODE;
     prefs.end();
 
     strncpy(udpHost, h.c_str(), sizeof(udpHost) - 1);
@@ -299,7 +298,6 @@ void saveSettings() {
     prefs.putBool("sleepOn", sleepEnabled);
     prefs.putUInt("sampleRate", sampleRate);
     prefs.putBool("configured", configured);
-    prefs.putBool("debugMode", debugMode);
     prefs.end();
 }
 
@@ -372,12 +370,6 @@ void handlePostConfig() {
         }
         changed = true;
     }
-    if (server.hasArg("debug_mode")) {
-        String val = server.arg("debug_mode");
-        debugMode = (val == "true" || val == "1");
-        changed = true;
-    }
-
     if (changed) {
         configured = true;
         saveSettings();
@@ -398,9 +390,17 @@ void handlePostConfig() {
     // Re-evaluate sleep status immediately when the sleep setting changes.
     // If sleep was just enabled and we're outside the active window, sleep now.
     // If sleep was just disabled, we simply stay awake (no action needed).
-    if (sleepSettingChanged && sleepEnabled && streamingStarted && !debugMode) {
+    if (sleepSettingChanged && sleepEnabled && !debugMode) {
+        // Ensure NTP time is available for the active-window check.
+        // If streaming hasn't started yet, syncTime() hasn't been called.
+        struct tm checkTime;
+        if (!getLocalTime(&checkTime)) {
+            Serial.println("[Schedule] No NTP time — syncing now for sleep evaluation");
+            syncTime();
+        }
         if (!isWithinActiveWindow()) {
             Serial.println("[Schedule] Sleep enabled while outside active window — going to sleep");
+            delay(100);  // Allow HTTP response to flush before sleeping
             uint64_t sleepSec = secondsUntilNextActiveWindow();
             enterDeepSleep(sleepSec);
         }
