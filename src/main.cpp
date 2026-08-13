@@ -1392,6 +1392,11 @@ void enterDeepSleep(uint64_t sleepSeconds) {
     // Ensure microphone is powered down before sleeping
     digitalWrite(MIC_POWER_PIN, LOW);
 
+    // Turn off all LEDs before sleeping — GPIO state can persist across deep sleep
+    // and the onboard NeoPixel retains its last color if not explicitly cleared.
+    neopixelWrite(RGB_BUILTIN, 0, 0, 0);
+    statusLedStop();
+
     Serial.flush();
     esp_sleep_enable_timer_wakeup(sleepSeconds * 1000000ULL);
     esp_deep_sleep_start();
