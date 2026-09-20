@@ -1392,6 +1392,11 @@ void enterDeepSleep(uint64_t sleepSeconds) {
     // Ensure microphone is powered down before sleeping
     digitalWrite(MIC_POWER_PIN, LOW);
 
+    // Turn off LEDs before entering deep sleep — the onboard WS2812 can
+    // retain its last state through the sleep transition if not explicitly cleared.
+    neopixelWrite(RGB_BUILTIN, 0, 0, 0);
+    statusLedStop();
+
     Serial.flush();
     esp_sleep_enable_timer_wakeup(sleepSeconds * 1000000ULL);
     esp_deep_sleep_start();
@@ -1894,12 +1899,16 @@ void startStreaming() {
 }
 
 void setup() {
-    WRITE_PERI_REG(RTC_CNTL_BROWN_OUT_REG, 0); // Disable brownout detector    
+    WRITE_PERI_REG(RTC_CNTL_BROWN_OUT_REG, 0); // Disable brownout detector
+
+    // Turn off the onboard RGB LED as the very first action — the WS2812 on GPIO 48
+    // can wake in a random/bright state after deep sleep and the 1s serial delay
+    // would leave it visibly on. Must happen before any delay().
+    neopixelWrite(RGB_BUILTIN, 0, 0, 0);
+    pinMode(RGB_BUILTIN, OUTPUT);
+
     Serial.begin(115200);
     delay(1000);
-
-    // Turn off the onboard RGB LED immediately — it may retain state across resets
-    neopixelWrite(RGB_BUILTIN, 0, 0, 0);
 
     // Initialize the external status LED
     statusLedInit();
@@ -1919,6 +1928,11 @@ void setup() {
     loadSettings();
 
     wifiInit();
+
+    // Boot flash has served its purpose — turn the status LED off before
+    // continuing. The Blinkenlight flash() leaves state_ HIGH after expiry
+    // because the underlying mode (OFF) doesn't actively drive LOW.
+    statusLedStop();
 
     // Always start OTA, mDNS, and HTTP so the device is discoverable
     otaInit();
