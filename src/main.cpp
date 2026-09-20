@@ -119,6 +119,50 @@ bool sleepEnabled   = false;
 
 const bool debugMode = DEBUG_MODE;  // When true, deep sleep is completely disabled (compile-time only)
 
+// ─── Deep-Sleep Wake Safeguards (RTC-persisted across deep sleep) ────────────
+// These live in RTC slow memory so they survive deep sleep. They let a night
+// wake make cheap, safe decisions *before* spending battery on the full
+// WiFi + NTP boot path, and prevent the device from getting stuck failing to
+// wake in the morning.
+//
+//   rtcWakeTargetEpoch   absolute UTC epoch we intend to be awake again. When a
+//                        long sleep is split into MAX_SLEEP_SECONDS chunks, this
+//                        remembers the real morning target so intermediate wakes
+//                        can nap again without recomputing sun times.
+//   rtcSleepFailStreak   consecutive wakes where we could not establish time.
+//                        Used to back off retries instead of hammering WiFi/NTP.
+//   rtcLastKnownEpoch    last good clock value saved before sleeping — a coarse
+//                        fallback so we can estimate the schedule even if NTP is
+//                        briefly unavailable on wake.
+RTC_DATA_ATTR uint64_t rtcWakeTargetEpoch  = 0;
+RTC_DATA_ATTR uint32_t rtcSleepFailStreak  = 0;
+RTC_DATA_ATTR uint64_t rtcLastKnownEpoch    = 0;
+
+// Battery guard: raw ADC volts below this are treated as "too low to stream".
+// The 12V battery divider is /5.7, so raw*5.7 = real volts.
+//
+// The solar-voltage ADC (VSOL) is not physically connected, so "is the battery
+// charging?" is inferred from daylight instead: during the active window
+// (roughly sunrise-1h to sunset+1h) the sun is up and the solar panel is
+// replenishing the pack. Outside that window it's dark and the battery only
+// drains.
+//
+// Two-tier scheme so daylight charging is accounted for:
+//   BATT_LOW_ADC_V       "low" — nap only if it's dark (no charging). In
+//                        daylight the panel is recovering the pack, so we stay
+//                        awake and keep recording rather than napping needlessly.
+//   BATT_CRITICAL_ADC_V  "critical" — nap regardless of daylight. This protects
+//                        the pack from deep-discharge damage and brownout even
+//                        at dawn/dusk when charge current is still weak.
+#define BATT_LOW_ADC_V        1.93f            // ≈ 11.0V — low, nap only if dark
+#define BATT_CRITICAL_ADC_V   1.75f            // ≈ 10.0V — nap regardless of daylight
+#define BATT_RECOVERY_SLEEP_S (30ULL * 60)     // 30-minute recovery nap when low
+
+// When time is unknown on wake, retry sooner than a full cycle but back off as
+// failures accumulate so a dead network overnight doesn't drain the battery.
+#define SLEEP_NOTIME_BASE_S   (10ULL * 60)     // first no-time retry: 10 min
+#define SLEEP_NOTIME_MAX_S    (60ULL * 60)     // cap no-time backoff at 1 hour
+
 // ─── Diagnostic Mode State ────────────────────────────────────────────────────
 bool diagnosticMode = false;  // true when /diag/start has been called
 unsigned long lastDiagTelemetryTime = 0;
@@ -229,6 +273,9 @@ void startStreaming();
 IPAddress resolveHost(const char* hostname);
 void streamAudio();
 void enterDeepSleep(uint64_t sleepSeconds);
+void armTimerAndSleep(uint64_t sleepSeconds);
+void evaluateWakeAndMaybeNap();
+bool batteryCritical();
 bool isWithinActiveWindow();
 uint64_t secondsUntilNextActiveWindow();
 void syncTime();
@@ -1181,6 +1228,16 @@ void syncTime() {
     Serial.println();
 
     if (retries >= 20) {
+        // NTP didn't sync in time. On a battery/solar deployment with sleep
+        // enabled, a hard restart here can become an overnight reboot loop that
+        // drains the pack and leaves the device dead by morning. Instead, when
+        // sleep is enabled, take a short backoff nap and try again on the next
+        // wake — the schedule logic tracks the failure streak in RTC memory.
+        if (sleepEnabled && !debugMode) {
+            Serial.println("[NTP] Failed to sync time — backing off with a nap (sleep enabled)");
+            enterDeepSleep(secondsUntilNextActiveWindow());
+            // never returns
+        }
         Serial.println("[NTP] Failed to sync time — restarting");
         delay(3000);
         ESP.restart();
@@ -1295,9 +1352,18 @@ bool isWithinActiveWindow() {
 uint64_t secondsUntilNextActiveWindow() {
     struct tm timeinfo;
     if (!getLocalTime(&timeinfo)) {
-        Serial.println("[Schedule] Cannot get time — fallback 1 hour sleep");
-        return 3600; // Fallback: sleep 1 hour and retry
+        // Time unknown — back off progressively so a dead network overnight
+        // doesn't burn battery re-trying WiFi/NTP every hour. The streak is
+        // persisted in RTC memory so it survives the sleep we're about to enter.
+        uint64_t backoff = SLEEP_NOTIME_BASE_S << (rtcSleepFailStreak > 3 ? 3 : rtcSleepFailStreak);
+        if (backoff > SLEEP_NOTIME_MAX_S) backoff = SLEEP_NOTIME_MAX_S;
+        if (rtcSleepFailStreak < 0xFFFF) rtcSleepFailStreak++;
+        Serial.printf("[Schedule] Cannot get time (streak %lu) — retry in %llu s\n",
+            (unsigned long)rtcSleepFailStreak, backoff);
+        return backoff;
     }
+    // Got a valid clock — clear the no-time failure streak.
+    rtcSleepFailStreak = 0;
 
     double nowMin = timeinfo.tm_hour * 60.0 + timeinfo.tm_min + timeinfo.tm_sec / 60.0;
 
@@ -1347,11 +1413,172 @@ uint64_t secondsUntilNextActiveWindow() {
 // RTC timer overflow/drift issues on long sleep durations.
 #define MAX_SLEEP_SECONDS  (2ULL * 3600)
 
+// ─── Arm the deep-sleep timer and sleep (with error handling) ────────────────
+// esp_sleep_enable_timer_wakeup() can fail (ESP_ERR_INVALID_ARG) if the
+// requested duration is out of the RTC timer's supported range. If we called
+// esp_deep_sleep_start() without a valid wake source armed, the device would
+// sleep forever and never wake — the worst possible outcome for a headless
+// field unit. This helper verifies the timer was armed; if not, it reboots
+// instead so the device comes back and re-evaluates rather than going dark.
+// On success it does not return.
+void armTimerAndSleep(uint64_t sleepSeconds) {
+    esp_err_t err = esp_sleep_enable_timer_wakeup(sleepSeconds * 1000000ULL);
+    if (err != ESP_OK) {
+        Serial.printf("[Sleep] ERROR: esp_sleep_enable_timer_wakeup(%llu s) failed (err=%d) — "
+                      "rebooting instead of sleeping without a wake source\n",
+                      sleepSeconds, (int)err);
+        Serial.flush();
+        delay(1000);
+        ESP.restart();
+        // never returns
+    }
+    esp_deep_sleep_start();
+    // never returns
+}
+
+// ─── Battery guard (daylight-aware) ──────────────────────────────────────────
+// Decides whether the battery is too low to safely run the radio. VSOL is not
+// wired, so "is the battery charging?" is inferred from daylight: within the
+// active window the sun is up and the panel is charging. Reads the battery ADC
+// directly (readPowerMonitor caches into globals, but on a fresh wake those may
+// be stale/zero).
+//
+// Decision:
+//   - Battery >= low threshold                    -> OK to run.
+//   - Battery critical (very low)                 -> nap, even in daylight.
+//     Protects the pack from deep discharge / brownout.
+//   - Battery low but it's daylight (charging)     -> OK to run. The panel is
+//     replenishing the pack, so napping would just miss recording for no gain.
+//   - Battery low and it's dark (not charging)     -> nap and wait for sun.
+bool batteryCritical() {
+    float vBatAdc = readAdcVoltage(VBAT_ADC_PIN);
+
+    // Ignore obviously-bogus zero reads (divider disconnected during self-test,
+    // ADC not yet settled) so we never falsely nap on a good battery.
+    if (vBatAdc < 0.10f) {
+        Serial.printf("[Sleep] Battery ADC read %.3fV looks disconnected — ignoring guard\n", vBatAdc);
+        return false;
+    }
+
+    // Daylight = within the active window. If time isn't known (NTP not yet
+    // synced on a cold wake), isWithinActiveWindow() defaults to true, but for
+    // this guard we want the conservative interpretation, so we only treat it
+    // as daylight when the clock is actually valid.
+    struct tm timeinfo;
+    bool timeValid = getLocalTime(&timeinfo);
+    bool daylight  = timeValid && isWithinActiveWindow();
+
+    // Critical: protect the pack regardless of daylight.
+    if (vBatAdc < BATT_CRITICAL_ADC_V) {
+        Serial.printf("[Sleep] Battery CRITICAL: %.3fV raw (≈%.1fV) — recovery nap (daylight=%s)\n",
+            vBatAdc, vBatAdc * 5.7f, daylight ? "yes" : "unknown/no");
+        return true;
+    }
+
+    // Low but not critical: only nap if it's dark (no charging).
+    if (vBatAdc < BATT_LOW_ADC_V) {
+        if (daylight) {
+            Serial.printf("[Sleep] Battery low (%.3fV/≈%.1fV) but daylight — staying awake to record & charge\n",
+                vBatAdc, vBatAdc * 5.7f);
+            return false;
+        }
+        Serial.printf("[Sleep] Battery low (%.3fV/≈%.1fV) and dark%s — recovery nap\n",
+            vBatAdc, vBatAdc * 5.7f, timeValid ? "" : " (time unknown)");
+        return true;
+    }
+
+    return false;
+}
+
+// ─── Wake-time re-evaluation (cheap, runs before WiFi/NTP) ───────────────────
+// Called very early in setup() after a deep-sleep wake. Uses only RTC-persisted
+// state and the internal RTC clock (no WiFi, no NTP) to decide whether we should
+// immediately nap again. This is the key safeguard against battery-draining
+// boot loops during a long overnight sleep and against failing to wake at the
+// scheduled time. If it decides to nap, it does not return.
+//
+// It intentionally does NOT try to be clever about the schedule — that still
+// happens once per real wake via isWithinActiveWindow(). Its only jobs are:
+//   1. If the battery is too low AND it's dark (not charging), take a recovery
+//      nap (a critically low battery naps even in daylight, to protect the pack).
+//   2. If we woke early from a split long-sleep and the RTC clock says we are
+//      still well before the real wake target, nap for the remaining time.
+void evaluateWakeAndMaybeNap() {
+    esp_sleep_wakeup_cause_t cause = esp_sleep_get_wakeup_cause();
+    if (cause != ESP_SLEEP_WAKEUP_TIMER) {
+        // Cold boot / reset / OTA — not a scheduled wake. Clear stale targets so
+        // a fresh schedule is computed normally.
+        rtcWakeTargetEpoch = 0;
+        return;
+    }
+
+    Serial.println("[Sleep] Woke from timer — running wake safeguards");
+
+    // Bring up the ADC so the battery guard can read a real value.
+    analogSetAttenuation(ADC_11db);
+    analogReadResolution(12);
+
+    // Safeguard 1: battery too low to run the radio — nap and let solar recover.
+    // batteryCritical() is daylight-aware: a low-but-not-critical battery during
+    // the active window will NOT nap here, so the device wakes and records once
+    // the sun is up and the panel is charging.
+    if (batteryCritical()) {
+        Serial.println("[Sleep] Battery too low on wake — taking recovery nap");
+        Serial.flush();
+        // Bump the wake target forward so we don't fight the schedule after the nap.
+        if (rtcLastKnownEpoch > 0) rtcLastKnownEpoch += BATT_RECOVERY_SLEEP_S;
+        armTimerAndSleep(BATT_RECOVERY_SLEEP_S);
+        // never returns
+    }
+
+    // Safeguard 2: we split a long sleep into chunks. If the RTC clock (which
+    // survives deep sleep) says we're still meaningfully before the real wake
+    // target, nap the remainder without paying for WiFi + NTP.
+    if (rtcWakeTargetEpoch > 0) {
+        time_t nowEpoch = time(nullptr);
+        // The internal RTC keeps counting across deep sleep, so time() should be
+        // close to our saved epoch even without NTP. Only trust it if it looks sane.
+        if ((uint64_t)nowEpoch > rtcLastKnownEpoch && (uint64_t)nowEpoch < rtcWakeTargetEpoch) {
+            uint64_t remaining = rtcWakeTargetEpoch - (uint64_t)nowEpoch;
+            // Only bother napping again if there's a worthwhile chunk left; a
+            // small remainder just falls through to the normal wake path.
+            if (remaining > 120) {
+                uint64_t nap = remaining > MAX_SLEEP_SECONDS ? MAX_SLEEP_SECONDS : remaining;
+                Serial.printf("[Sleep] Still %llu s before wake target — napping %llu s more\n",
+                    remaining, nap);
+                Serial.flush();
+                armTimerAndSleep(nap);
+                // never returns
+            }
+        }
+    }
+
+    // Reached the real wake target (or clock was unreliable) — clear the target
+    // and let setup() proceed with the normal WiFi + NTP + schedule path.
+    Serial.println("[Sleep] Wake target reached — proceeding with full boot");
+    rtcWakeTargetEpoch = 0;
+}
+
 void enterDeepSleep(uint64_t sleepSeconds) {
     // Debug mode: refuse to sleep under any circumstances
     if (debugMode) {
         Serial.printf("[Sleep] BLOCKED — debug mode active (would have slept %llu s)\n", sleepSeconds);
         return;
+    }
+
+    // ─── Safeguard: record the real wake target before we split the sleep ────
+    // If the requested sleep is longer than a single MAX_SLEEP_SECONDS chunk we
+    // will wake early and nap again. Remember the absolute epoch we ultimately
+    // want to be awake at, so intermediate wakes can decide to keep sleeping
+    // without paying for a full WiFi + NTP re-evaluation each time.
+    {
+        time_t nowEpoch = time(nullptr);
+        if (nowEpoch > 1600000000) {  // sane clock (> 2020) — record targets
+            rtcLastKnownEpoch = (uint64_t)nowEpoch;
+            rtcWakeTargetEpoch = (uint64_t)nowEpoch + sleepSeconds;
+        }
+        // If the clock is not sane we leave the RTC targets untouched; the wake
+        // path falls back to timer-only behaviour.
     }
 
     // Cap sleep duration to avoid RTC timer reliability issues
@@ -1398,8 +1625,7 @@ void enterDeepSleep(uint64_t sleepSeconds) {
     statusLedStop();
 
     Serial.flush();
-    esp_sleep_enable_timer_wakeup(sleepSeconds * 1000000ULL);
-    esp_deep_sleep_start();
+    armTimerAndSleep(sleepSeconds);
 }
 
 // ─── Audio Streaming ─────────────────────────────────────────────────────────
@@ -1929,6 +2155,17 @@ void setup() {
 
     // Load saved settings from NVS before WiFi (so portal shows current values)
     loadSettings();
+
+    // ─── Wake safeguards ─────────────────────────────────────────────────────
+    // If this boot is a scheduled deep-sleep wake, run the cheap RTC-only
+    // evaluation BEFORE bringing up WiFi. This may immediately nap again (low
+    // battery, or still before the real wake target on a split long sleep),
+    // which is what prevents overnight boot-loops and battery drain — and, by
+    // extension, ensures the device still has charge to actually wake and run
+    // in the morning. Only relevant when sleep is enabled and not in debug mode.
+    if (sleepEnabled && !debugMode) {
+        evaluateWakeAndMaybeNap();
+    }
 
     wifiInit();
 
