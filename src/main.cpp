@@ -1827,7 +1827,10 @@ void burstSendPackets() {
 #define MDNS_ANNOUNCE_INTERVAL_MS   (120 * 1000)  // Re-advertise mDNS every 2 minutes
 #define WIFI_CHECK_INTERVAL_MS      (30 * 1000)   // Check WiFi connectivity every 30s
 #define NTP_RESYNC_INTERVAL_MS      (6UL * 60 * 60 * 1000)  // Re-sync NTP every 6 hours
-#define WIFI_RECONNECT_MAX_ATTEMPTS 5             // Max reconnect attempts before reboot
+// After this many failed reconnect attempts, escalate to a full radio reset.
+// A full OFF->STA cycle forces a fresh scan/association, which is what recovers
+// the link once a previously-unavailable SSID comes back on the air.
+#define WIFI_HARD_RESET_AFTER       3
 unsigned long lastScheduleCheck = 0;
 unsigned long lastMdnsAnnounce = 0;
 unsigned long lastWifiCheck = 0;
@@ -1963,12 +1966,30 @@ void loop() {
         lastWifiCheck = millis();
         if (WiFi.status() != WL_CONNECTED) {
             wifiReconnectAttempts++;
-            Serial.printf("[WiFi] Disconnected! Reconnect attempt %d/%d...\n",
-                wifiReconnectAttempts, WIFI_RECONNECT_MAX_ATTEMPTS);
+            Serial.printf("[WiFi] Disconnected! Reconnect attempt %d...\n",
+                wifiReconnectAttempts);
 
-            WiFi.disconnect(false);
-            delay(100);
-            WiFi.begin();  // reconnect using stored credentials
+            // Escalation strategy: the first couple of attempts do a light
+            // re-association. When the SSID has been gone for a while (router
+            // reboot, AP outage), a light WiFi.begin() often will not re-scan
+            // and re-associate once the AP returns, so after a few failures we
+            // do a full radio OFF->STA cycle to force a fresh scan.
+            //
+            // We NEVER reboot here and NEVER fall back into the captive portal:
+            // this is a headless device that must rejoin its designated network
+            // autonomously whenever it comes back on the air.
+            if (wifiReconnectAttempts % WIFI_HARD_RESET_AFTER == 0) {
+                Serial.println("[WiFi] Escalating to full radio reset...");
+                wifiRadioReset();      // OFF -> STA cycle, keeps stored creds
+                wifiSetHostname();
+                WiFi.setSleep(false);
+                WiFi.setTxPower(WIFI_POWER_19_5dBm);
+                WiFi.begin();          // re-associate using stored credentials
+            } else {
+                WiFi.disconnect(false);
+                delay(100);
+                WiFi.reconnect();      // lightweight re-association attempt
+            }
 
             // Wait up to 10s for reconnection
             unsigned long start = millis();
@@ -1980,10 +2001,8 @@ void loop() {
                 Serial.printf("[WiFi] Reconnected! IP: %s, RSSI: %d\n",
                     WiFi.localIP().toString().c_str(), WiFi.RSSI());
                 wifiReconnectAttempts = 0;
-            } else if (wifiReconnectAttempts >= WIFI_RECONNECT_MAX_ATTEMPTS) {
-                Serial.println("[WiFi] Too many reconnect failures — rebooting");
-                delay(1000);
-                ESP.restart();
+            } else {
+                Serial.println("[WiFi] Still down — will retry at next check");
             }
         } else {
             wifiReconnectAttempts = 0;  // reset counter when connected
